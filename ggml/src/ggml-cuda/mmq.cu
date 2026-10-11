@@ -123,13 +123,79 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
         prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
     }
 
-    // Q4 only for the FP4 types on Blackwell
-    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    // Q4 only for the FP4 types on Blackwell (and only for UNDEFINED/Q4, the FP4 default).
+    // GGML_PREC_F32 (activations may exceed F16 range) falls through to Q8_1 here;
+    // ggml_cuda_mul_mat_q handles the F32-range rescale.
     const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
-    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+    if (prec == GGML_PREC_F32 || prec == GGML_PREC_Q8 || !can_use_q4) {
         return GGML_PREC_Q8;
     }
     return GGML_PREC_Q4;
+}
+
+// global max-abs reduction over src1, result written to result[0] via atomicMax (float-as-int,
+// monotone for non-negative values)
+static __global__ void amax_f32_kernel(
+        const float * __restrict__ x, float * __restrict__ result,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03) {
+    float lmax = 0.0f;
+    const int64_t total = ne00*ne01*ne02*ne03;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < total; i += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t i00 = i % ne00;
+        const int64_t i01 = (i / ne00) % ne01;
+        const int64_t i02 = (i / (ne00*ne01)) % ne02;
+        const int64_t i03 = i / (ne00*ne01*ne02);
+        lmax = fmaxf(lmax, fabsf(x[i03*s03 + i02*s02 + i01*s01 + i00]));
+    }
+    for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+        lmax = fmaxf(lmax, __shfl_xor_sync(0xFFFFFFFF, lmax, offset, WARP_SIZE));
+    }
+    __shared__ float warp_max[32];
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        warp_max[warp] = lmax;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float block_max = 0.0f;
+        for (int w = 0; w < (int) (blockDim.x + WARP_SIZE - 1)/WARP_SIZE; ++w) {
+            block_max = fmaxf(block_max, warp_max[w]);
+        }
+        atomicMax((int *) result, __float_as_int(block_max));
+    }
+}
+
+// element-wise scale of an F32 tensor (dst) by a constant, honouring its nb strides
+static __global__ void scale_f32_kernel(
+        float * __restrict__ x, const float scale,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne01, const int64_t ne02, const int64_t ne03) {
+    const int64_t total = ne00*ne01*ne02*ne03;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < total; i += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t i00 = i % ne00;
+        const int64_t i01 = (i / ne00) % ne01;
+        const int64_t i02 = (i / (ne00*ne01)) % ne02;
+        const int64_t i03 = i / (ne00*ne01*ne02);
+        x[i03*s03 + i02*s02 + i01*s01 + i00] *= scale;
+    }
+}
+
+static void ggml_cuda_mul_mat_q_scale_dst(const ggml_tensor * dst, const float scale, cudaStream_t stream) {
+    if (scale == 1.0f) {
+        return;
+    }
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+    const int64_t ne3 = dst->ne[3];
+    const int64_t ts  = ggml_type_size(dst->type);
+    const int64_t total = ne0*ne1*ne2*ne3;
+    const int num_blocks = total == 0 ? 1 : (int) MIN((int64_t) 1024, (total + 255)/256);
+    scale_f32_kernel<<<num_blocks, 256, 0, stream>>>(
+        (float *) dst->data, scale, ne0, dst->nb[1]/ts, dst->nb[2]/ts, dst->nb[3]/ts, ne1, ne2, ne3);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_mul_mat_q(
@@ -182,6 +248,34 @@ void ggml_cuda_mul_mat_q(
     const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
 
     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+
+    // F32 src1 (activations may exceed F16 range): rescale src1 down by a power of two before
+    // quantization and rescale dst back after the matmul. This keeps the Q8_1 block scale and
+    // partial-sum fields (F16 in the DS4/D2S6 layouts) inside F16 range, and the power-of-two
+    // scale is exact. Mirrors the metal backend's amax rescale (kernel_mul_mm_id_amax).
+    const bool f32_src1 = (ggml_prec) ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
+    float src1_rescale = 1.0f;
+    if (f32_src1) {
+        const int64_t ne_src1  = ne10*ne11*ne12*ne13;
+        const int64_t s11      = nb11 / ts_src1;
+        const int64_t s12      = nb12 / ts_src1;
+        const int64_t s13      = nb13 / ts_src1;
+        ggml_cuda_pool_alloc<float> src1_amax(ctx.pool());
+        src1_amax.alloc(1);
+        CUDA_CHECK(cudaMemsetAsync(src1_amax.ptr, 0, sizeof(float), stream));
+        const int amax_num_blocks = ne_src1 == 0 ? 1 : (int) MIN((int64_t) 1024, (ne_src1 + 255)/256);
+        amax_f32_kernel<<<amax_num_blocks, 256, 0, stream>>>(src1_d, src1_amax.ptr, ne10, s11, s12, s13, ne11, ne12, ne13);
+        CUDA_CHECK(cudaGetLastError());
+        float amax_host = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&amax_host, src1_amax.ptr, sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // scale = 2^(ceil(log2(amax)) - 10) -> scaled amax <= 1024, so a 32-value raw sum is
+        // <= 32768 < 65504 (F16 max). isfinite: src1 already inf/nan is not ours to fix.
+        if (isfinite(amax_host) && amax_host > 1024.0f) {
+            src1_rescale = exp2f(ceilf(log2f(amax_host)) - 10.0f);
+        }
+    }
+    const float src1_rescale_inv = 1.0f / src1_rescale;
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
@@ -251,7 +345,7 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src1_rescale_inv, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -271,6 +365,7 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             ne1, J_best};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        ggml_cuda_mul_mat_q_scale_dst(dst, src1_rescale, stream);
         return;
     }
 
@@ -327,10 +422,10 @@ void ggml_cuda_mul_mat_q(
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
-            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_rescale_inv, src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_rescale_inv, src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -351,6 +446,7 @@ void ggml_cuda_mul_mat_q(
         ne12, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+    ggml_cuda_mul_mat_q_scale_dst(dst, src1_rescale, stream);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

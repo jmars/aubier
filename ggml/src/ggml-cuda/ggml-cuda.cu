@@ -1979,7 +1979,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
-        return false;
+        // F32 src1 precision requires a host sync for the amax rescale in ggml_cuda_mul_mat_q
+        return ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
     }
 
     if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
@@ -3632,7 +3633,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_MUL) {
+    // P-FORK K3: GGML_MOE_WR_DISABLE=1 disables the moe_weighted_reduction graph
+    // fusion. The fused kernel and the unfused mul+views+adds path are different
+    // execution geometries whose FP-level differences the model's near-tie greedy
+    // dynamics amplify; value-preservation gates compare against the UNFUSED
+    // reference (this env set on both arms) so they are bitwise-comparable.
+    if (node->op == GGML_OP_MUL && getenv("GGML_MOE_WR_DISABLE") == nullptr) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
@@ -5438,9 +5444,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
                     return false;
                 }
-                if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
-                    return false;
-                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -5862,6 +5865,14 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    // F32-src1 MUL_MAT_ID (mistral4 down projection): never op-offload a host-pinned weight.
+    // The amax rescale needs a host sync and moves the result off the CPU placement, which would
+    // change the output when the weight is pinned to CPU (-ot / -ncmoe). Natural GPU placement
+    // (weight resident on the GPU) is unaffected: offload_op is only consulted for host weights.
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+        return false;
+    }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }

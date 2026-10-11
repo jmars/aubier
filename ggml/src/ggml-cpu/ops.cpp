@@ -5368,6 +5368,59 @@ static void ggml_compute_forward_get_rows_f32(
     }
 }
 
+// P-FORK: ggml_moe_split — resident/non-resident mask for a routed expert selection
+// (1.0 if the expert is resident, 0.0 otherwise). See ggml_moe_split() in ggml.c.
+void ggml_compute_forward_moe_split(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * ids = dst->src[0];   // [n_expert_used, n_tokens] i32
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens      = ids->ne[1];
+
+    const uint32_t mask[4] = {
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
+        (uint32_t) ggml_get_op_params_i32(dst, 2),
+        (uint32_t) ggml_get_op_params_i32(dst, 3),
+    };
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (n_tokens + nth - 1) / nth;
+    const int64_t t0 = dr * ith;
+    const int64_t t1 = MIN(t0 + dr, n_tokens);
+
+    // DEBUG: dump the ids the op reads and the mask it writes, for the first token.
+    static bool dumped = false;
+
+    for (int64_t t = t0; t < t1; ++t) {
+        float * row = (float *) ((char *) dst->data + t * dst->nb[1]);
+
+        for (int64_t e = 0; e < n_expert_used; ++e) {
+            // ids is [n_expert_used, n_tokens] (e over dim 0, t over dim 1); it is a
+            // NON-contiguous view of the argsort output (nb[1] = n_expert*4 bytes), so
+            // the stride for e is nb[0], not nb[1].
+            const int32_t expert = *(const int32_t *) ((const char *) ids->data + e * ids->nb[0] + t * ids->nb[1]);
+
+            GGML_ASSERT(expert >= 0 && expert < 128);
+
+            row[e] = (mask[expert >> 5] >> (expert & 31)) & 1u ? 1.0f : 0.0f;
+
+            if (!dumped && getenv("LLAMA_MOE_SPLIT_DUMP") && t == 0) {
+                fprintf(stderr, "[moe_split DEBUG] n_used=%lld n_tok=%lld ids nb0=%zu nb1=%zu | t=0 e=%lld expert=%d -> mask=%.1f\n",
+                        (long long) n_expert_used, (long long) n_tokens,
+                        ids->nb[0], ids->nb[1], (long long) e, expert, row[e]);
+            }
+        }
+        if (getenv("LLAMA_MOE_SPLIT_DUMP") && t == 0) {
+            dumped = true;
+        }
+    }
+}
+
 void ggml_compute_forward_get_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

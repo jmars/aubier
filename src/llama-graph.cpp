@@ -2423,6 +2423,150 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+// P-FORK: Mistral-Small-4-specialized MoE block. Router is identical to the shared
+// build_moe_ffn() (128 experts, top-n_expert_used, shared expert handled by the caller);
+// the routed experts are then computed as TWO residency-partitioned chains and summed.
+// M2: both chains run on ONE backend (serial). M3: resident chain on GPU, non-resident
+// on CPU, concurrently. The GEMM reuses ggml's MUL_MAT_ID kernel (the packed
+// model-specific weight layout is a later milestone); the specialization here is the
+// residency split + the two-half weighted sum, which stock cannot express.
+ggml_tensor * llm_graph_context::build_moe_ffn_mistral4_split(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * gate_up_exps,
+         ggml_tensor * down_exps,
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+                bool   norm_w,
+               float   w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int   il) const {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+
+    // --- router: identical to build_moe_ffn --------------------------------
+    ggml_tensor * logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
+    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        ggml_prec_set_acc(logits, GGML_PREC_F32);
+    }
+    cb(logits, "ffn_moe_logits", il);
+
+    ggml_tensor * probs = nullptr;
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+            probs = ggml_soft_max(ctx0, logits);
+            break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+            probs = ggml_sigmoid(ctx0, logits);
+            break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
+            probs = logits;
+            break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+            probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits));
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+    cb(probs, "ffn_moe_probs", il);
+
+    ggml_tensor * selection_probs = probs;
+    if (exp_probs_b != nullptr) {
+        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+        cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+    cb(selected_experts->src[0], "ffn_moe_argsort", il);
+    cb(selected_experts, "ffn_moe_topk", il);
+
+    probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+    cb(weights, "ffn_moe_weights", il);
+
+    if (norm_w) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
+        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        weights = ggml_div(ctx0, weights, weights_sum);
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+    }
+    if (w_scale != 0.0f && w_scale != 1.0f) {
+        weights = ggml_scale(ctx0, weights, w_scale);
+        cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    ggml_build_forward_expand(gf, weights);
+
+    // --- residency split (P-FORK) -----------------------------------------
+    // mask [n_expert_used, n_tokens] = 1.0 where the routed expert is resident.
+    // The expert ids themselves stay on the backend that produced them; only this
+    // small F32 mask crosses to weight the two halves (avoids an I32 ids copy).
+    ggml_tensor * mask = ggml_moe_split(ctx0, selected_experts);
+    cb(mask, "ffn_moe_split", il);
+
+    ggml_tensor * mask3 = ggml_reshape_3d(ctx0, mask, 1, n_expert_used, n_tokens); // [1, n_expert_used, n_tokens]
+    ggml_tensor * resident_w    = ggml_mul(ctx0, weights, mask3);
+    ggml_tensor * nonresident_w = ggml_sub(ctx0, weights, resident_w);
+
+    // --- resident chain (M3: GPU stream) -----------------------------------
+    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * gate_up_r = build_lora_mm_id(gate_up_exps, cur, selected_experts, nullptr, nullptr); // [n_ff*2, n_expert_used, n_tokens]
+    cb(gate_up_r, "ffn_moe_gate_up_r", il);
+
+    const int64_t n_ff = gate_up_r->ne[0] / 2;
+    ggml_tensor * gate_r = ggml_view_3d(ctx0, gate_up_r, n_ff, gate_up_r->ne[1], gate_up_r->ne[2], gate_up_r->nb[1], gate_up_r->nb[2], 0);
+    ggml_tensor * up_r   = ggml_view_3d(ctx0, gate_up_r, n_ff, gate_up_r->ne[1], gate_up_r->ne[2], gate_up_r->nb[1], gate_up_r->nb[2], n_ff * gate_up_r->nb[0]);
+    ggml_tensor * h_r = ggml_swiglu_split(ctx0, gate_r, up_r);
+    cb(h_r, "ffn_moe_swiglu_r", il);
+
+    ggml_tensor * down_r = build_lora_mm_id(down_exps, h_r, selected_experts, nullptr, nullptr); // [n_embd, n_expert_used, n_tokens]
+    ggml_prec_set_src(down_r, GGML_PREC_F32, 1); // mistral4: src1 can exceed F16 range
+    cb(down_r, "ffn_moe_down_raw_r", il); // DEBUG: raw down, before weighting
+    down_r = ggml_mul(ctx0, down_r, resident_w);
+    cb(down_r, "ffn_moe_down_r", il);
+
+    // --- non-resident chain (M3: CPU threads) ------------------------------
+    ggml_tensor * gate_up_n = build_lora_mm_id(gate_up_exps, cur, selected_experts, nullptr, nullptr);
+    cb(gate_up_n, "ffn_moe_gate_up_n", il);
+
+    ggml_tensor * gate_n = ggml_view_3d(ctx0, gate_up_n, n_ff, gate_up_n->ne[1], gate_up_n->ne[2], gate_up_n->nb[1], gate_up_n->nb[2], 0);
+    ggml_tensor * up_n   = ggml_view_3d(ctx0, gate_up_n, n_ff, gate_up_n->ne[1], gate_up_n->ne[2], gate_up_n->nb[1], gate_up_n->nb[2], n_ff * gate_up_n->nb[0]);
+    ggml_tensor * h_n = ggml_swiglu_split(ctx0, gate_n, up_n);
+    cb(h_n, "ffn_moe_swiglu_n", il);
+
+    ggml_tensor * down_n = build_lora_mm_id(down_exps, h_n, selected_experts, nullptr, nullptr);
+    ggml_prec_set_src(down_n, GGML_PREC_F32, 1);
+    down_n = ggml_mul(ctx0, down_n, nonresident_w);
+    cb(down_n, "ffn_moe_down_n", il);
+
+    // --- sum each half over the expert slots, then combine -----------------
+    ggml_tensor * r_exps[LLAMA_MAX_EXPERTS] = { nullptr };
+    ggml_tensor * n_exps[LLAMA_MAX_EXPERTS] = { nullptr };
+    for (uint32_t i = 0; i < (uint32_t) n_expert_used; ++i) {
+        r_exps[i] = ggml_view_2d(ctx0, down_r, n_embd, n_tokens, down_r->nb[2], i * down_r->nb[1]);
+        n_exps[i] = ggml_view_2d(ctx0, down_n, n_embd, n_tokens, down_n->nb[2], i * down_n->nb[1]);
+
+        ggml_build_forward_expand(gf, r_exps[i]);
+        ggml_build_forward_expand(gf, n_exps[i]);
+    }
+
+    ggml_tensor * r_sum = r_exps[0];
+    ggml_tensor * n_sum = n_exps[0];
+    for (uint32_t i = 1; i < (uint32_t) n_expert_used; ++i) {
+        r_sum = ggml_add(ctx0, r_sum, r_exps[i]);
+        n_sum = ggml_add(ctx0, n_sum, n_exps[i]);
+    }
+
+    ggml_tensor * moe_out = ggml_add(ctx0, r_sum, n_sum);
+    ggml_build_forward_expand(gf, moe_out);
+    cb(moe_out, "ffn_moe_out_split", il);
+
+    return moe_out;
+}
+
 ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * selected_experts,
          ggml_tensor * up_exps,

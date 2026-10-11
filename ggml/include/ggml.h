@@ -586,6 +586,11 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
 
+        // P-FORK: split a Mistral-Small-4 routed-expert list (top-4 of 128) into
+        // resident / non-resident halves by a 128-bit residency mask, returning
+        // padded id + weight lists for two fixed-shape MUL_MAT_ID chains.
+        GGML_OP_MOE_SPLIT,
+
         GGML_OP_UNARY,
 
         GGML_OP_MAP_CUSTOM1,
@@ -1502,6 +1507,22 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // P-FORK: compute the resident/non-resident mask for a routed-expert selection.
+    //   ids    -> [n_expert_used, n_tokens] (i32)
+    //   result -> [n_expert_used, n_tokens] (f32): 1.0 if the routed expert is
+    //             resident, 0.0 otherwise.
+    //   residency is a 128-bit mask carried in op_params (4 x i32); bit e set => expert e resident.
+    //   the op is CPU-only (the CUDA backend reports it unsupported and the scheduler
+    //   falls back to CPU, which is the intended placement for a per-token 4-wide op).
+    //   Returning the MASK (not partitioned ids) keeps the expert ids on the backend
+    //   that produced them, avoiding a CPU->GPU copy of an I32 ids tensor.
+    GGML_API struct ggml_tensor * ggml_moe_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids);
+
+    // P-FORK: set the residency mask (4 x uint32, bit e => expert e resident).
+    GGML_API void ggml_moe_split_set_residency(struct ggml_tensor * t, const uint32_t mask[4]);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

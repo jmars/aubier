@@ -1195,6 +1195,22 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps,
                      int   il) const;
 
+    // P-FORK: Mistral-Small-4-specialized MoE block. Same signature as the shared
+    // build_moe_ffn(); computes the routed experts as TWO residency-partitioned
+    // partial sums (resident vs non-resident), summed. Serial in M2, concurrent in M3.
+    ggml_tensor * build_moe_ffn_mistral4_split(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * gate_up_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il) const;
+
     //
     // inputs
     //

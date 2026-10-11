@@ -1085,6 +1085,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
 
+    "MOE_SPLIT",
+
     "UNARY",
 
     "MAP_CUSTOM1",
@@ -1101,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1200,6 +1202,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
 
+    "moe_split(ids, weights)",
+
     "unary(x)",
 
     "map_custom(x)",
@@ -1216,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3423,6 +3427,39 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[2] = ids;
 
     return result;
+}
+
+// ggml_moe_split (P-FORK)
+
+struct ggml_tensor * ggml_moe_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);   // ids is 2d: [n_expert_used, n_tokens]
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens      = ids->ne[1];
+
+    const int64_t ne[4] = { n_expert_used, n_tokens, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op     = GGML_OP_MOE_SPLIT;
+    result->src[0] = ids;
+
+    // default residency: first half of the experts resident (bit mask 0..63).
+    // DEBUG(all-resident): set every expert resident to isolate mask-routing vs chain.
+    uint32_t mask[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+    ggml_moe_split_set_residency(result, mask);
+
+    return result;
+}
+
+void ggml_moe_split_set_residency(struct ggml_tensor * t, const uint32_t mask[4]) {
+    GGML_ASSERT(t->op == GGML_OP_MOE_SPLIT);
+    GGML_ASSERT(GGML_MAX_OP_PARAMS / sizeof(int32_t) >= 4);
+    for (int i = 0; i < 4; ++i) {
+        ggml_set_op_params_i32(t, i, (int32_t) mask[i]);
+    }
 }
 
 // ggml_out_prod
