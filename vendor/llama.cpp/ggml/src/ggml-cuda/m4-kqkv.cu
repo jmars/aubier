@@ -75,7 +75,8 @@ static float * m4_kqkv_part_ptr() {
 // from the stock mul_mat's tiled/SIMD order, and online softmax accumulates the denominator
 // instead of a single-pass normalise), so it is gated by the QUALITY instrument (--score +
 // scripts/nll_eval.py), never by byte-identity — the token line is chaotic under a 1-ulp-class
-// perturbation (LEDGER L57).  The softmax is numerically stable: the running max is subtracted
+// perturbation (measured: a one-ulp change in one kernel reaches O(1) in the logits by position
+// 100).  The softmax is numerically stable: the running max is subtracted
 // before every exp, so a long window cannot overflow (max-subtraction is mandatory, not
 // cosmetic — a kernel that overflows on a long window is a latent bug a short run cannot expose).
 
