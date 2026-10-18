@@ -19,7 +19,11 @@ models/
 fixtures/
 builds/
 venvs/
-vendor/
+# the vendored llama.cpp IS versioned (the repo must build without a clone),
+# but never its build outputs — and its own .git was removed before the first commit
+vendor/llama.cpp/.git
+vendor/llama.cpp/build/
+vendor/llama.cpp/build-*/
 prefixes/
 logs/
 *.gguf
