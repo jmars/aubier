@@ -3,11 +3,12 @@
 # no-sudo ROCm toolchain that lives entirely inside venvs/rocm (TheRock wheels).
 #
 # Usage:  scripts/build_hip.sh [configure|build|all]   (default: all)
-# Env:    JOBS (default 8), clean configure with RECONFIGURE=1
+# Env:    JOBS (default 8), clean configure with RECONFIGURE=1,
+#         VENV/SRC/BUILD to build a tree other than this one
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="$ROOT/venvs/rocm"
+VENV="${VENV:-$ROOT/venvs/rocm}"
 SRC="${SRC:-$ROOT/vendor/llama.cpp}"
 BUILD="${BUILD:-$ROOT/builds/hip}"
 JOBS="${JOBS:-8}"

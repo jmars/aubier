@@ -35,14 +35,21 @@ tools/         fixture builders (grouped-expert GGUF fixtures for the loader)
 
 ## Building
 
-`aubier` builds against a **vendored llama.cpp** (for ggml) with our patch applied:
+The ggml tree the engine builds against is **vendored and already patched** — `vendor/llama.cpp/` is llama.cpp at
+`50e3e3e4` with our three M4 ops applied. It is pruned to the four libraries the engine links, so `vendor/README.md`
+is where the prune, the reason the build names library targets instead of `all`, and the recipe for restoring a full
+upstream tree are recorded.
+
+Two prerequisites are machine-local, so they are not in this repository:
+
+* a **ROCm toolchain as a Python venv** at `venvs/rocm` (AMD's ROCm pip wheels — `rocm`, `rocm-sdk-devel`,
+  `rocm-sdk-libraries-<arch>-all`), used through `venvs/rocm/bin/python`; `build_hip.sh` asks `rocm-sdk path`
+  for the prefix rather than hardcoding one;
+* the model weights (a 2-bit GGUF of Mistral Small 4).
 
 ```sh
-git clone https://github.com/ggml-org/llama.cpp vendor/llama.cpp
-cd vendor/llama.cpp && git checkout 50e3e3e480c80b9ee0ea067e475602d540dc62c8
-patch -p1 < ../../patches/ggml-m4/custom-op-m4.patch
-cd ../.. && sh scripts/build_hip.sh        # produces builds/hip
-sh scripts/engine_build_m1.sh             # produces builds/engine/m1
+sh scripts/build_hip.sh          # the four ggml libraries -> builds/hip   (VENV/SRC/BUILD override)
+sh scripts/engine_build_m1.sh    # the engine -> builds/engine/m1
 ```
 
 `builds/hip` is the engine's `GGML_LIB`; `builds/hip-fork` is a second build used only for the reference binaries the
