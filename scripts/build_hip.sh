@@ -8,15 +8,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/venvs/rocm"
-SRC="$ROOT/vendor/llama.cpp"
-BUILD="$ROOT/builds/hip"
+SRC="${SRC:-$ROOT/vendor/llama.cpp}"
+BUILD="${BUILD:-$ROOT/builds/hip}"
 JOBS="${JOBS:-8}"
 MODE="${1:-all}"
 
 # --- ROCm prefix discovery: ask the toolchain itself, never hardcode ----------
 # rocm-sdk path --root -> .../_rocm_sdk_devel (holds lib/cmake, bin/hipcc, lib/*.so)
-ROCM_PREFIX="$("$VENV/bin/rocm-sdk" path --root)"
-ROCM_BIN="$("$VENV/bin/rocm-sdk" path --bin)"
+ROCM_PREFIX="$("$VENV/bin/python" "$VENV/bin/rocm-sdk" path --root)"
+ROCM_BIN="$("$VENV/bin/python" "$VENV/bin/rocm-sdk" path --bin)"
 [ -d "$ROCM_PREFIX" ] || { echo "FATAL: ROCm prefix not found: $ROCM_PREFIX" >&2; exit 1; }
 
 # CMake >= 4.x refuses the hipcc wrapper as CMAKE_HIP_COMPILER ("This is not
@@ -46,6 +46,9 @@ if [ "$MODE" = configure ] || [ "$MODE" = all ]; then
     -DCMAKE_HIP_FLAGS="--rocm-path=$ROCM_PREFIX --rocm-device-lib-path=$ROCM_PREFIX/lib/llvm/amdgcn/bitcode" \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_CURL=OFF \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+    -DGGML_CCACHE=OFF \
     -DCMAKE_PREFIX_PATH="$ROCM_PREFIX" \
     -DHIP_PLATFORM=amd \
     -DCMAKE_BUILD_RPATH="$ROCM_PREFIX/lib" \
@@ -53,7 +56,10 @@ if [ "$MODE" = configure ] || [ "$MODE" = all ]; then
 fi
 
 if [ "$MODE" = build ] || [ "$MODE" = all ]; then
-  cmake --build "$BUILD" -j "$JOBS"
+  # TARGETS, not "all": the vendored tree carries only what builds these four
+  # libraries (the engine links exactly these). "all" would also want tests/,
+  # examples/, tools/ and app/ sources, which are not vendored.
+  cmake --build "$BUILD" --target ggml ggml-base ggml-cpu ggml-hip -j "$JOBS"
 fi
 
 echo "OK: $BUILD/bin"
