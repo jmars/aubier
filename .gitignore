@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# aubier — PUBLIC repo. What is here is the engine and the way to build it.
+# ---------------------------------------------------------------------------
+
+# ---- INTERNAL, deliberately never published -------------------------------
+# the append-only findings index, the plans, the per-unit reports, the design
+# notes, the pinned experiment config, and the vendor/build notes.
+LEDGER.md
+todo.md
+engine-plan.md
+results/
+docs/
+config/
+VENDOR.md
+# (those all still exist on disk — they are just not part of the public history)
+
+# ---- large / reproducible / machine-local --------------------------------
+models/
+fixtures/
+builds/
+venvs/
+vendor/
+prefixes/
+logs/
+*.gguf
+*.logits
+*.logits.tokens
+*.npy
+*.bin
+gpucore.*
+core.*
+*.o
+*.so
+*.so.*
+__pycache__/
+*.pyc

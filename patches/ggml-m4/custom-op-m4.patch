@@ -1,0 +1,435 @@
+diff -ru src/llama-route/ggml/include/ggml.h src/llama.cpp/ggml/include/ggml.h
+--- src/llama-route/ggml/include/ggml.h	2026-10-09 16:34:08.763089725 +0000
++++ src/llama.cpp/ggml/include/ggml.h	2026-10-18 18:53:16.445719104 +0000
+@@ -601,6 +601,36 @@
+ 
+         GGML_OP_GLU,
+ 
++        // MISTRAL-SMALL-4-ONLY (the aubier engine's M1 H3-U4 custom-op hatch).  A single
++        // shape-specialized kernel for the MLA absorption gemv: src0 = the Q8_0 weights
++        // attn_k_b [64, 256, 32] (wk_b), src1 = the F32 nope-half activation [64, 32, 1]
++        // laid out as 32 heads x 128-float stride, dst = F32 [256, 32, 1] (one head per
++        // 256-float block).  NO generality, NO fallback, NO runtime shape dispatch — the
++        // shape/type/geometry are fixed and the CPU handler is a fatal abort.
++        GGML_OP_M4_WKB,
++
++        // MISTRAL-SMALL-4-ONLY (the aubier engine's M1 H3-U5 custom-op hatch).  A single
++        // shape-specialized kernel fusing the attention core: the K^T.Q scores + the causal
++        // softmax + the V-weighted contraction over the KV extent, i.e. it replaces the
++        // kq mul_mat, the soft_max_ext and the kqv mul_mat (+ the vT copy) with ONE kernel.
++        //   src0 = the KV cache kcache  F16 [320, n_kv_max] (K rows [0,320), V rows [0,256))
++        //   src1 = the query Qcur        F32 [320, 32, 1]  (32 heads x 320-float stride)
++        //   src2 = the causal mask       F32 [n_kv_max, 1] (0.0 / -INFINITY)
++        //   dst  = the attention output  F32 [256, 1, 32]  (one 256-float block per head)
++        // op_param[0] = kq_scale (the softmax scale).  NO generality, NO fallback, NO runtime
++        // shape dispatch — the shape/type/geometry are fixed and the CPU handler is fatal.
++        GGML_OP_M4_KQKV,
++
++        // MISTRAL-SMALL-4-ONLY (the aubier engine's M1 H3-U11 custom-op hatch).  ONE op for the
++        // attention chain's remaining per-token PHASE fusions, selected by op_params[0] so the
++        // nine GGML_OP_COUNT-sized tables grow by ONE entry instead of one per phase:
++        //   phase 0 (M4_PHASE_KVWRITE): wkv_a_mqa gemv + attn_kv_a_norm + k_pe rope + the Kcur
++        //     concat + the set_rows scatter into the KV cache, as two launches of one node;
++        //   phase 1 (M4_PHASE_WVB): attn_v_b (the MLA value absorption gemv, `kqv_mla`), one.
++        // Shapes are fixed and asserted per phase in the builder and re-asserted in the
++        // launcher; the CPU handler is fatal (the CPU arm is the numerics oracle).
++        GGML_OP_M4_PHASE,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -1484,6 +1514,71 @@
+             struct ggml_tensor  * a,
+             struct ggml_tensor  * b);
+ 
++    // MISTRAL-SMALL-4-ONLY (the aubier engine's M1 H3-U4 custom-op hatch).  The MLA
++    // absorption gemv as ONE named op that a specialized HIP kernel runs inside the
++    // captured CUDA graph: a = wk_b (Q8_0 [64, 256, 32], attn_k_b.weight), b = the
++    // nope-half activation (F32 [64, 32, 1] with a 128-float head stride, i.e. a view of
++    // the [128, 32, 1] q_b output).  Returns F32 [256, 32, 1], one 256-float block per
++    // head.  Shape and type are asserted; there is no dispatch and no CPU path (the CPU
++    // handler aborts).
++    GGML_API struct ggml_tensor * ggml_m4_wkb(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b);
++
++    // MISTRAL-SMALL-4-ONLY (the aubier engine's M1 H3-U5 custom-op hatch).  The fused attention
++    // core as ONE named op that a specialized HIP kernel runs inside the captured CUDA graph:
++    //   kcache = the KV cache (F16 [320, n_kv_max]; K = rows [0,320), V = rows [0,256)),
++    //   q      = the query Qcur (F32 [320, 32, 1], head stride 320 — the g_qcur layout),
++    //   mask   = the causal mask (F32 [n_kv_max, 1], 0.0 / -INFINITY).
++    // Returns F32 [256, 1, 32], one 256-float block per head, = scores(K^T.Q) * kq_scale ->
++    // softmax(masked) -> sum over the KV extent weighted by V.  Shape and type are asserted;
++    // there is no dispatch and no CPU path (the CPU handler aborts).
++    GGML_API struct ggml_tensor * ggml_m4_kqkv(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * kcache,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * mask,
++            float                 kq_scale);
++
++    // MISTRAL-SMALL-4-ONLY (the aubier engine's M1 H3-U11 custom-op hatch): the KV-write phase
++    // as ONE named op — the wkv_a_mqa gemv, attn_kv_a_norm, the k_pe rope, the Kcur concat and
++    // the set_rows scatter into the KV cache, in a single node (two kernels inside it).
++    //   cur    = the attn_norm output (F32 [4096, 1]),
++    //   wkv_a  = attn_kv_a_mqa.weight (Q8_0 [4096, 320]),
++    //   kvn    = attn_kv_a_norm.weight (F32 [256]),
++    //   kcache = the F16 [320, n_kv_max] KV cache, WRITTEN IN PLACE (as ggml_set_rows does),
++    //   kidx   = the I64 [1] cache row,  pos = the I32 [1] rope position.
++    // Returns the post-norm/post-rope Kcur (F32 [320, 1]) — the values the cache row received.
++    // The rope parameters are the engine's (op_params: an int32 array — the layout is
++    // documented on the builder in ggml.c).
++    GGML_API struct ggml_tensor * ggml_m4_phase_kvwrite(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * cur,
++            struct ggml_tensor  * wkv_a,
++            struct ggml_tensor  * kvn,
++            struct ggml_tensor  * kcache,
++            struct ggml_tensor  * kidx,
++            struct ggml_tensor  * pos,
++            float                 freq_base,
++            float                 freq_scale,
++            float                 ext_factor,
++            float                 attn_factor,
++            float                 beta_fast,
++            float                 beta_slow,
++            float                 eps,
++            int                   n_dims,
++            int                   n_ctx_orig);
++
++    // MISTRAL-SMALL-4-ONLY (H3-U11): the MLA value absorption gemv (`kqv_mla`) as ONE op.
++    //   wv_b = attn_v_b.weight (Q8_0 [256, 128, 32]),  x = the attention output (F32 [256,1,32]).
++    // Returns F32 [128, 1, 32] — the same ne[] layout the reference mul_mat produces, so the
++    // downstream head-recombination reshape is unchanged.
++    GGML_API struct ggml_tensor * ggml_m4_phase_wvb(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * wv_b,
++            struct ggml_tensor  * x);
++
+     // change the precision of a matrix multiplication
+     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
+     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
+diff -ru src/llama-route/ggml/include/ggml-rpc.h src/llama.cpp/ggml/include/ggml-rpc.h
+--- src/llama-route/ggml/include/ggml-rpc.h	2026-10-09 16:34:08.762089738 +0000
++++ src/llama.cpp/ggml/include/ggml-rpc.h	2026-10-18 18:42:45.861557542 +0000
+@@ -8,10 +8,10 @@
+ 
+ #define RPC_PROTO_MAJOR_VERSION    8
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    0
++#define RPC_PROTO_PATCH_VERSION    3
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff -ru src/llama-route/ggml/src/ggml.c src/llama.cpp/ggml/src/ggml.c
+--- src/llama-route/ggml/src/ggml.c	2026-10-09 16:34:08.889088088 +0000
++++ src/llama.cpp/ggml/src/ggml.c	2026-10-18 18:53:18.983693089 +0000
+@@ -1099,9 +1099,15 @@
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "M4_WKB",
++
++    "M4_KQKV",
++
++    "M4_PHASE",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1214,9 +1220,16 @@
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "m4_wkb(W, x)",
++
++    "m4_kqkv(kcache, q, mask)",
++
++    "m4_phase(phase)",
++
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -3385,6 +3398,146 @@
+     ggml_set_op_params_i32(a, 1, hint_i32);
+ }
+ 
++// MISTRAL-SMALL-4-ONLY: the MLA absorption gemv as one named op (see ggml.h).  The shape is
++// fixed and asserted; there is no generality, no dispatch and no CPU path.  b must be laid
++// out exactly as the engine builds it (a view of the [128, 32, 1] q_b output with a 128-float
++// head stride), which the kernel reads byte-explicitly.
++struct ggml_tensor * ggml_m4_wkb(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b) {
++    GGML_ASSERT(a->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(a->ne[0] == 64 && a->ne[1] == 256 && a->ne[2] == 32 && a->ne[3] == 1);
++    GGML_ASSERT(b->type == GGML_TYPE_F32);
++    GGML_ASSERT(b->ne[0] == 64 && b->ne[1] == 32 && b->ne[2] == 1 && b->ne[3] == 1);
++    GGML_ASSERT(b->nb[1] == 512);   // 128-float head stride, the engine's q_nope view
++
++    const int64_t ne[4] = { 256, 32, 1, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    result->op     = GGML_OP_M4_WKB;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
++// MISTRAL-SMALL-4-ONLY: the fused attention core as one named op (see ggml.h).  The shape is
++// fixed and asserted; there is no generality, no dispatch and no CPU path.  kcache is the
++// per-layer F16 [320, n_kv_max] KV cache (K = rows [0,320), V = rows [0,256)); q is the F32
++// Qcur [320, 32, 1] with a 320-float head stride; mask is the F32 causal mask [n_kv_max, 1].
++struct ggml_tensor * ggml_m4_kqkv(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * kcache,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * mask,
++        float                 kq_scale) {
++    GGML_ASSERT(kcache->type == GGML_TYPE_F16);
++    // the head geometry is pinned (Mistral Small 4); the KV width is DYNAMIC (H3-U6) — the
++    // kernel is a tile loop whose bound is kcache->ne[1], so a wide cache (e.g. full-corpus
++    // scoring at kv-max 2501, or a future 256k context) is honoured, not silently sliced.
++    GGML_ASSERT(kcache->ne[0] == 320 && kcache->ne[1] >= 1 && kcache->ne[2] == 1 && kcache->ne[3] == 1);
++    GGML_ASSERT(q->type == GGML_TYPE_F32);
++    GGML_ASSERT(q->ne[0] == 320 && q->ne[1] == 32 && q->ne[2] == 1 && q->ne[3] == 1);
++    GGML_ASSERT(mask->type == GGML_TYPE_F32);
++    GGML_ASSERT(mask->ne[0] == kcache->ne[1] && mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1);
++
++    // [256, 1, 32, 1]: d fastest (256), then the token batch (1), then the heads (32) — the
++    // SAME ne[] layout as the reference g_kqv (mul_mat(vT, softmax(kq))), which the downstream
++    // attn_v_b mul_mat keys its head dim off (ne[2] == 32 == the weight's ne[2]).
++    const int64_t ne[4] = { 256, 1, 32, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    ggml_set_op_params_f32(result, 0, kq_scale);
++
++    result->op     = GGML_OP_M4_KQKV;
++    result->src[0] = kcache;
++    result->src[1] = q;
++    result->src[2] = mask;
++
++    return result;
++}
++
++// MISTRAL-SMALL-4-ONLY: the attention chain's remaining per-token PHASE fusions, one op
++// (GGML_OP_M4_PHASE) with op_params[0] selecting the phase.  Fixed shapes, asserted here and
++// re-asserted in the launcher; there is no dispatch, no fallback and no CPU path.
++// op_params INT32 INDICES (ggml_set_op_params_* index an int32 array, they are NOT byte
++// offsets — a byte offset here silently writes past op_params and corrupts src[] in a
++// Release build, where the bounds assert is compiled out): 0 = phase (i32), 1..6 = freq_base,
++// freq_scale, ext_factor, attn_factor, beta_fast, beta_slow (f32), 7 = eps (f32),
++// 8 = n_dims (i32), 9 = n_ctx_orig (i32).
++struct ggml_tensor * ggml_m4_phase_kvwrite(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * cur,
++        struct ggml_tensor  * wkv_a,
++        struct ggml_tensor  * kvn,
++        struct ggml_tensor  * kcache,
++        struct ggml_tensor  * kidx,
++        struct ggml_tensor  * pos,
++        float                 freq_base,
++        float                 freq_scale,
++        float                 ext_factor,
++        float                 attn_factor,
++        float                 beta_fast,
++        float                 beta_slow,
++        float                 eps,
++        int                   n_dims,
++        int                   n_ctx_orig) {
++    GGML_ASSERT(cur->type == GGML_TYPE_F32);
++    GGML_ASSERT(cur->ne[0] == 4096 && cur->ne[1] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1);
++    GGML_ASSERT(wkv_a->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(wkv_a->ne[0] == 4096 && wkv_a->ne[1] == 320 && wkv_a->ne[2] == 1 && wkv_a->ne[3] == 1);
++    GGML_ASSERT(kvn->type == GGML_TYPE_F32 && kvn->ne[0] == 256);
++    GGML_ASSERT(kcache->type == GGML_TYPE_F16);
++    GGML_ASSERT(kcache->ne[0] == 320 && kcache->ne[2] == 1 && kcache->ne[3] == 1);
++    GGML_ASSERT(kidx->type == GGML_TYPE_I64 && kidx->ne[0] == 1);
++    GGML_ASSERT(pos->type == GGML_TYPE_I32 && pos->ne[0] == 1);
++
++    const int64_t ne[4] = { 320, 1, 1, 1 };   // Kcur: the row the cache received
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++    result->op     = GGML_OP_M4_PHASE;
++    result->src[0] = cur;
++    result->src[1] = wkv_a;
++    result->src[2] = kvn;
++    result->src[3] = kcache;
++    result->src[4] = kidx;
++    result->src[5] = pos;
++
++    ggml_set_op_params_i32(result, 0, 0);               // M4_PHASE_KVWRITE
++    ggml_set_op_params_f32(result, 1, freq_base);
++    ggml_set_op_params_f32(result, 2, freq_scale);
++    ggml_set_op_params_f32(result, 3, ext_factor);
++    ggml_set_op_params_f32(result, 4, attn_factor);
++    ggml_set_op_params_f32(result, 5, beta_fast);
++    ggml_set_op_params_f32(result, 6, beta_slow);
++    ggml_set_op_params_f32(result, 7, eps);
++    ggml_set_op_params_i32(result, 8, n_dims);
++    ggml_set_op_params_i32(result, 9, n_ctx_orig);
++
++    return result;
++}
++
++struct ggml_tensor * ggml_m4_phase_wvb(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * wv_b,
++        struct ggml_tensor  * x) {
++    GGML_ASSERT(wv_b->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(wv_b->ne[0] == 256 && wv_b->ne[1] == 128 && wv_b->ne[2] == 32 && wv_b->ne[3] == 1);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->ne[0] == 256 && x->ne[1] == 1 && x->ne[2] == 32 && x->ne[3] == 1);
++
++    // [128, 1, 32]: the SAME ne[] layout the reference mul_mat(wv_b, g_kqv) produces, which the
++    // downstream head-recombination reshape_2d keys off.
++    const int64_t ne[4] = { 128, 1, 32, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++    result->op     = GGML_OP_M4_PHASE;
++    result->src[0] = wv_b;
++    result->src[1] = x;
++
++    ggml_set_op_params_i32(result, 0, 1);               // M4_PHASE_WVB
++    return result;
++}
++
+ // ggml_mul_mat_id
+ 
+ /*
+diff -ru src/llama-route/ggml/src/ggml-cpu/ggml-cpu.c src/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c
+--- src/llama-route/ggml/src/ggml-cpu/ggml-cpu.c	2026-10-09 16:34:08.772089608 +0000
++++ src/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c	2026-10-18 18:42:45.860557556 +0000
+@@ -2061,6 +2061,26 @@
+             {
+                 ggml_compute_forward_glu(params, tensor);
+             } break;
++        case GGML_OP_M4_WKB:
++            {
++                // MISTRAL-SMALL-4-ONLY: this op has no CPU kernel.  It must never be
++                // silently mis-run on the CPU arm — the engine only emits it on the
++                // GPU-core path, so reaching here is a build/graph bug, not a mode.
++                GGML_ABORT("GGML_OP_M4_WKB has no CPU handler (Mistral-Small-4-only GPU op)");
++            } break;
++        case GGML_OP_M4_KQKV:
++            {
++                // MISTRAL-SMALL-4-ONLY: no CPU kernel, same rule as GGML_OP_M4_WKB — the
++                // engine only emits the fused attention core on the GPU-core path.
++                GGML_ABORT("GGML_OP_M4_KQKV has no CPU handler (Mistral-Small-4-only GPU op)");
++            } break;
++
++        case GGML_OP_M4_PHASE:
++            {
++                // MISTRAL-SMALL-4-ONLY: no CPU kernel, same rule as GGML_OP_M4_WKB — the
++                // engine only emits the fused phase ops on the GPU-core path.
++                GGML_ABORT("GGML_OP_M4_PHASE has no CPU handler (Mistral-Small-4-only GPU op)");
++            } break;
+         case GGML_OP_GET_REL_POS:
+             {
+                 ggml_compute_forward_get_rel_pos(params, tensor);
+@@ -2348,6 +2368,12 @@
+                     GGML_ABORT("fatal error");
+             }
+             break;
++        case GGML_OP_M4_WKB:
++            GGML_ABORT("GGML_OP_M4_WKB has no CPU handler (Mistral-Small-4-only GPU op)");
++        case GGML_OP_M4_KQKV:
++            GGML_ABORT("GGML_OP_M4_KQKV has no CPU handler (Mistral-Small-4-only GPU op)");
++        case GGML_OP_M4_PHASE:
++            GGML_ABORT("GGML_OP_M4_PHASE has no CPU handler (Mistral-Small-4-only GPU op)");
+         case GGML_OP_SILU_BACK:
+         case GGML_OP_MUL:
+         case GGML_OP_DIV:
+diff -ru src/llama-route/ggml/src/ggml-cuda/ggml-cuda.cu src/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
+--- src/llama-route/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-09 16:34:08.784089452 +0000
++++ src/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-18 18:42:35.459705393 +0000
+@@ -70,6 +70,9 @@
+ #include "ggml-cuda/cumsum.cuh"
+ #include "ggml-cuda/fill.cuh"
+ #include "ggml-cuda/lightning-indexer.cuh"
++#include "ggml-cuda/m4-wkb.cuh"
++#include "ggml-cuda/m4-kqkv.cuh"
++#include "ggml-cuda/m4-phase.cuh"
+ #include "ggml.h"
+ 
+ #include <algorithm>
+@@ -2498,6 +2501,15 @@
+         case GGML_OP_LIGHTNING_INDEXER:
+             ggml_cuda_lightning_indexer(ctx, dst);
+             break;
++        case GGML_OP_M4_WKB:
++            ggml_cuda_m4_wkb(ctx, dst);
++            break;
++        case GGML_OP_M4_KQKV:
++            ggml_cuda_m4_kqkv(ctx, dst);
++            break;
++        case GGML_OP_M4_PHASE:
++            ggml_cuda_m4_phase(ctx, dst);
++            break;
+         default:
+             return false;
+     }
+@@ -5833,6 +5845,43 @@
+             return true;
+         case GGML_OP_LIGHTNING_INDEXER:
+             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
++        case GGML_OP_M4_WKB:
++            // Mistral-Small-4-only, fixed shape; the launcher re-asserts the shape.
++            return op->src[0]->type == GGML_TYPE_Q8_0 && op->src[0]->ne[0] == 64 &&
++                   op->src[0]->ne[1] == 256 && op->src[0]->ne[2] == 32 &&
++                   op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[0] == 64 &&
++                   op->src[1]->ne[1] == 32 && op->src[1]->ne[2] == 1;
++        case GGML_OP_M4_KQKV:
++            // Mistral-Small-4-only head geometry; the KV width is DYNAMIC (H3-U6) — any >= 1.
++            // The launcher re-asserts the full contract.
++            return op->src[0]->type == GGML_TYPE_F16 && op->src[0]->ne[0] == 320 &&
++                   op->src[0]->ne[1] >= 1 && op->src[0]->ne[2] == 1 &&
++                   op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[0] == 320 &&
++                   op->src[1]->ne[1] == 32 && op->src[1]->ne[2] == 1 &&
++                   op->src[2]->type == GGML_TYPE_F32 && op->src[2]->ne[0] == op->src[0]->ne[1] &&
++                   op->src[2]->ne[1] == 1;
++        case GGML_OP_M4_PHASE:
++            // Mistral-Small-4-only phase fusions, selected by op_params[0].  The launcher
++            // re-asserts the full contract for the selected phase.
++            switch (ggml_get_op_params_i32(op, 0)) {
++                case 0:   // kvwrite: wkv_a gemv + kv_a_norm + k_pe rope + the cache scatter
++                    return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 4096 &&
++                           op->src[1]->type == GGML_TYPE_Q8_0 && op->src[1]->ne[0] == 4096 &&
++                           op->src[1]->ne[1] == 320 &&
++                           op->src[2]->type == GGML_TYPE_F32 && op->src[2]->ne[0] == 256 &&
++                           op->src[3]->type == GGML_TYPE_F16 && op->src[3]->ne[0] == 320 &&
++                           op->src[4]->type == GGML_TYPE_I64 && op->src[4]->ne[0] == 1 &&
++                           op->src[5]->type == GGML_TYPE_I32 && op->src[5]->ne[0] == 1 &&
++                           op->type == GGML_TYPE_F32 && op->ne[0] == 320;
++                case 1:   // wv_b (kqv_mla): the MLA value absorption gemv
++                    return op->src[0]->type == GGML_TYPE_Q8_0 && op->src[0]->ne[0] == 256 &&
++                           op->src[0]->ne[1] == 128 && op->src[0]->ne[2] == 32 &&
++                           op->src[1]->type == GGML_TYPE_F32 && op->src[1]->ne[0] == 256 &&
++                           op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 32 &&
++                           op->type == GGML_TYPE_F32 && op->ne[0] == 128 && op->ne[2] == 32;
++                default:
++                    return false;
++            }
+ 
+         default:
+             return false;
+Only in src/llama.cpp/ggml/src/ggml-cuda: m4-kqkv.cu
+Only in src/llama.cpp/ggml/src/ggml-cuda: m4-kqkv.cuh
+Only in src/llama.cpp/ggml/src/ggml-cuda: m4-phase.cu
+Only in src/llama.cpp/ggml/src/ggml-cuda: m4-phase.cuh
+Only in src/llama.cpp/ggml/src/ggml-cuda: m4-wkb.cu
+Only in src/llama.cpp/ggml/src/ggml-cuda: m4-wkb.cuh
