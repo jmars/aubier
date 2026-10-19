@@ -19,6 +19,7 @@
 // EXIT CODES: 0 = the check that was asked for passed; 1 = it failed (the FAIL lines say how).
 
 #include "gguf_model.h"
+#include "m1_session.h"   // U4: LoopArgs + the session seam (loop_run is m1_main.cpp's entry)
 #define STORE_INSTR 1     // U7: the get/combine split inside Store::drain (see engine/store.h)
 #include "m1_layer.h"
 #include "ggml-cpu.h"
@@ -37,7 +38,7 @@
 #include <sys/resource.h>
 #include <vector>
 
-static const char * DEFAULT_MODEL = "models/Mistral-Small-4-119B-2603-UD-IQ2_XXS.gguf";
+// DEFAULT_MODEL now lives in engine/m1_session.h (U4: the two TUs share one definition).
 
 // ---------------------------------------------------------------------------
 // the three checksums, printed in the reference's own format so a tier-A comparison is
@@ -58,7 +59,16 @@ struct EmbGraph {
     ggml_backend_buffer_t buf = nullptr;
     ggml_tensor * w = nullptr, * tin = nullptr, * out = nullptr;
     ggml_cgraph * gf = nullptr;
-    ~EmbGraph() { if (buf) ggml_backend_buffer_free(buf); if (ctx) ggml_free(ctx); }
+    ~EmbGraph() { release(); }
+    // U4FIX item 10: free the buffer and the context NOW.  close() calls this before the backend
+    // they were allocated from goes away, so the free order does not depend on where the session
+    // object's member destructors happen to run.
+    void release() {
+        if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; }
+        if (ctx) { ggml_free(ctx); ctx = nullptr; }
+        w = tin = out = nullptr;
+        gf = nullptr;
+    }
 
     void build(GGUFModel & m, ggml_backend_t backend) {
         ggml_init_params ip = { 16u << 20, nullptr, true };
@@ -111,7 +121,14 @@ struct HeadGraph {
     ggml_tensor * g_h = nullptr, * g_norm = nullptr, * g_logits = nullptr;
     ggml_cgraph * gf = nullptr;
     int64_t n_vocab = 0;
-    ~HeadGraph() { if (buf) ggml_backend_buffer_free(buf); if (ctx) ggml_free(ctx); }
+    ~HeadGraph() { release(); }
+    // U4FIX item 10: same contract as EmbGraph::release().
+    void release() {
+        if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; }
+        if (ctx) { ggml_free(ctx); ctx = nullptr; }
+        w_norm = w_out = g_h = g_norm = g_logits = nullptr;
+        gf = nullptr;
+    }
 
     void build(GGUFModel & m, ggml_backend_t backend) {
         ggml_init_params ip = { 16u << 20, nullptr, true };
@@ -294,7 +311,9 @@ static constexpr double REL_TRIGGER     = 1e-6;
 // dependency), the accepted object is fixed and small, and every field it consumes is CHECKed
 // (row count, row length, id range, uniqueness).  It accepts the producer's file and refuses
 // everything else — it is not a general JSON parser and does not pretend to be.
-static bool read_hotset_json(const char * path, std::vector<std::vector<int>> & hot, int & n_res) {
+// U4: extern — m1_main.cpp's --resident-set parse calls it (declared in engine/m1_session.h);
+// the server's flag parser will want the same loader.
+bool read_hotset_json(const char * path, std::vector<std::vector<int>> & hot, int & n_res) {
     FILE * f = std::fopen(path, "r");
     if (!f) { std::printf("FAIL: --resident-set: cannot open %s\n", path); return false; }
     std::string s;
@@ -617,24 +636,8 @@ static void audit_refresh_swap(Store * vram, Store * ram, int layer, int slot, i
 // ---------------------------------------------------------------------------
 // --layer-check
 // ---------------------------------------------------------------------------
-struct LayerCheckArgs {
-    std::string model   = DEFAULT_MODEL;
-    std::string tokens;
-    std::string ref;
-    std::string dump;
-    int         layers  = 1;
-    int         n_res   = 64;
-    int         ref_pos0 = -1;   // the position that ref step 0 is at (-1 => n_prompt)
-    int         kv_max  = 0;     // the KV/mask WIDTH (0 => n_pos, U2b: 256 matches the reference)
-    bool        router_margin = false;
-    int         threads = 16;
-    bool        do_oracle = true;
-    bool        do_store  = true;
-    // H1: per-layer ordered resident sets (empty => the identity interval [0,n_res), today's
-    // behaviour).  Read once from --resident-set and handed to the store list.
-    std::vector<std::vector<int>> res_hot;
-    std::string res_path;
-};
+// struct LayerCheckArgs lives in engine/m1_session.h (U4: main() moved to m1_main.cpp and
+// constructs it; the --layer-check path itself stays here).
 
 static bool read_tokens(const char * path, std::vector<int32_t> & ids, int & n_prompt) {
     FILE * f = std::fopen(path, "r");
@@ -657,7 +660,8 @@ static bool read_tokens(const char * path, std::vector<int32_t> & ids, int & n_p
     return true;
 }
 
-static int layer_check(const LayerCheckArgs & a) {
+// U4: extern — m1_main.cpp dispatches --layer-check here (declared in engine/m1_session.h).
+int layer_check(const LayerCheckArgs & a) {
     std::vector<int32_t> ids;
     int n_prompt = 0;
     if (!read_tokens(a.tokens.c_str(), ids, n_prompt)) return 1;
@@ -992,143 +996,10 @@ static int layer_check(const LayerCheckArgs & a) {
 // ---------------------------------------------------------------------------
 // --loop: the 36-layer token loop (U3).  ONE prompt per invocation.
 // ---------------------------------------------------------------------------
-struct LoopArgs {
-    std::string model  = DEFAULT_MODEL;
-    std::string tokens;          // read_tokens format: "n_prompt <P>" then the ids
-    std::string out;             // logits file (writes <out> and <out>.tokens)
-    std::string ref;             // the reference's stderr (tier A + the KV width assertion)
-    std::string ref_tokens;      // the reference's <logits>.tokens (the token line)
-    std::string dump;            // per-(layer, step) delta table
-    std::string route_dump;      // U6: per-(layer, pos) trace of the router's OWN ids+weights
-    std::string route_perm;      // U6: the treatment's per-layer id permutation (fixture map)
-    // H1 — THE RESIDENT SET: the per-layer ORDERED resident sets, read once from
-    // --resident-set <path.json>.  EMPTY => the identity interval [0,n_res) per layer, which is
-    // today's behaviour exactly (the store list is derived from the interval cut, unchanged).
-    std::vector<std::vector<int>> res_hot;
-    std::string res_path;
-    int    res_n = 0;            // the JSON's own n_res (CHECKed against --n-res when both are given)
-    bool   res_stats = false;    // H1: count the routed slots a VRAM store's slot() claims
-    int    n_decode = 128;
-    int    kv_max   = 256;       // <= 0 => the sequence length (U2's pre-fix width)
-    int    threads  = 16;
-    int    n_res    = 64;
-    bool   do_store = false;     // store arm (the product path); default = the oracle arm
-    // U4a — THE SPLIT: with this, a store whose SPEC says VRAM is built on the ROCm0 backend
-    // and a RAM store stays on the CPU (M0's mechanism, engine/moe_split.cpp build_stores).
-    // WITHOUT it every store is built on the CPU backend — the CPU-only configuration, which is
-    // the correctness path (its token line is byte-identical to the reference, U3/U3b) and is
-    // left untouched by this flag.
-    bool   gpu_store = false;
-    // U4c — THE CORE ON ROCm0: the layers' non-expert surface (attention/MLA/router/shexp
-    // weights + KV + inputs + intermediates) and the embedding/head graphs are built and run on
-    // the same ROCm0 backend the split uses, instead of the CPU.  INDEPENDENT of --gpu-store
-    // (core-on-GPU with the stores all-CPU is a meaningful row).  Default OFF: the CPU-only
-    // correctness path is untouched.  Requires --arm-store (the expert weights are not resident
-    // in the layer buffer in this mode — they live in the stores' slices) and will not be
-    // byte-identical to the CPU reference (different kernels; MEASURED and reported, never the
-    // token line).
-    bool   gpu_core = false;
-    // the falsifier
-    bool   falsify  = false;
-    int    f_layers = 1;
-    int    iters    = 5;
-    int    warmup   = 1;
-    bool   serialize_both = false;
-    double thresh   = 0.950;
-    // U7 — the per-position split (timing only): --instr turns on the named component counters
-    // in the store drive; --extra-stores N appends N EMPTY list entries per layer, an in-situ
-    // probe for the per-store-cycle overhead (numerics-neutral: an empty store enqueues no
-    // graph and drains no pending).
-    bool   instr = false;
-    int    extra_stores = 0;
-    // U7: the paired A/B arm for the output-D2H move (see engine/store.h's g_store_pull_at_drain)
-    bool   store_pull_at_drain = false;
-    // H2/U1 — THE FOOTPRINT PROBE (accounting only; behaviour-neutral, one print after the build).
-    // Every store allocates its OWN tensors (store.h `ggml_backend_alloc_ctx_tensors`) and
-    // upload_slice() memcpys the weights in, so the RAM store owns a PACKED COPY of its
-    // complement — host bytes that duplicate what the GGUF mmap already carries.  This prints the
-    // bytes each LOCATION class actually allocated, from the ggml buffers themselves, split
-    // VRAM-labelled vs RAM-labelled, plus the process's own VmRSS/RssAnon/RssFile so the
-    // anonymous share can be read off directly.  No numerics, no timing, no code path change.
-    bool   footprint = false;
-    // U2b: --alias-prefault (default OFF) hoists the zero-copy RAM store's file-page faults into
-    // the startup slot (store.h prefault_alias_slice).  A mechanism switch, not a numerics switch:
-    // the partition, the slot mapping and the combine order are untouched.
-    bool   alias_prefault = false;
-    // U2b — 2Q ROTATION (default OFF: with it off the engine is byte-identical to the shipped one,
-    // which is GATE 3a).  --rotate-verify adds the post-loop BYTE check of every resident slot.
-    bool   rotate = false;
-    bool   rotate_verify = false;
-    // U10 — the refresh audit's scope.  DEFAULT (false) checks what the refresh wrote (the admitted
-    // expert, the evicted one, their tables in both stores); --audit-full restores L50's full
-    // O(N_EXPERT) walk on the hot path.  The full walk runs once after the loop in BOTH cases.
-    bool   audit_full = true;
-    bool   audit_scope_set = false;   // U10: was the scope named EXPLICITLY (for the refusal above)
-    // U10 — the 2Q window's threshold: the k-th reference while non-resident admits.  DEFAULT 4,
-    // not the shipped 2: the frontier sweep (results/m1-h3-u10.md) measured k=4 at 6.98 uploads/token
-    // and served 0.6797 against 2Q's 19.32 and 0.6771 — the same coverage for a third of the bytes,
-    // and 4-8 ms/pos less loop wall.  `--rot-admit-k 2` restores the shipped policy bit for bit.
-    int    rot_admit_k = 4;
-    bool   rot_admit_k_set = false;
-    // U8 — THE RESIDENT FOLD (§10.2 item 3): fold the RESIDENT slice's MoE into the core graph
-    // so the per-layer VRAM-store sync boundary disappears.  Gated to --gpu-core + --gpu-store
-    // (the core and the resident store must be on the SAME backend) and to FLAT expert tensors.
-    bool   fold_resident = false;
-    // U9 — the fold's slot-count A/B (TIMING ONLY): 0..4 overrides the resident block's slot
-    // count (0 = no block, the "empty" variant; <4 drops top-k slots, so its numerics are WRONG
-    // by construction).  -1 (default) keeps the landed 4-slot fold.  Sizes the amplification
-    // bounded without touching the product numerics.
-    int    fold_slots = -1;
-    // H3/U1 — THE CORE PROBE (timing only, default OFF): after the loop has produced every number
-    // the run is judged on, measure the core graph on an idle stream under several launch/sync
-    // structures and at several nt values, so the core bracket can be decomposed into named
-    // components (launch, per-layer wait, tap enqueue, GPU exec of each phase).  It reads the
-    // layer the engine builds and changes nothing on the default path.
-    bool   core_probe = false;
-    int    probe_reps = 20;
-    // H3/U2 — the interleaved-idle probe (L54 MAJOR-2).  The product runs the core interleaved
-    // with ~440 us/layer of CPU-side store work, so the card sits idle-then-bursty between core
-    // launches; a probe that launches back to back measures full boost and overstates what the
-    // fusion would bank in situ.  --probe-gap-us inserts that host-busy idle between launches.
-    int    probe_gap_us = 440;
-    // H3/U2 — the attention chain's expression (see M1Layer::build): 0 = the landed reference
-    // expansion, 1 = the same math without the redundant head-recombination copy.  -1 (default)
-    // = 1 on the GPU-core path, i.e. the measured winner SHIPS: the two expressions are
-    // byte-identical on the product invocation (results/m1-h3-u2.md §6) and the fused one is
-    // faster in every paired row.  --core-fuse 0 is the A/B arm and keeps the reference
-    // expansion; the CPU-only path is always 0 (it is the numerics oracle).
-    int    core_fuse = -1;
-    // H3/U2 — the per-node census print (--instr only): every node of gf_core, classified.
-    bool   core_nodes = false;
-    // H3/U4 — the wk_b custom-op hatch (default OFF): replace the MLA-absorption mul_mat with
-    // the specialized GGML_OP_M4_WKB kernel inside the captured graph.  GPU-core only; the
-    // CPU-only arm (the gate's numerics oracle) keeps the reference mul_mat by construction.
-    int    m4_wkb = -1;      // H3/U4 + L58/L59 — TRI-STATE: -1 = AUTO (the wk_b custom-op is ON wherever
-                             // it applies, i.e. --gpu-core; quality EQUIVALENT at delta=0.01 over 39,984
-                             // paired positions, core -18.7 us/layer), 0 = --no-m4-wkb (the stock MMVQ
-                             // path, byte-identical to pre-H3-U4), 1 = --m4-wkb (explicit; needs --gpu-core).
-    int    m4_kqkv = -1;     // H3/U5 — TRI-STATE, same shape as m4_wkb: -1 = AUTO (the fused attention
-                             // core is ON wherever it applies, i.e. --gpu-core), 0 = --no-m4-kqkv (the
-                             // reference kq/softmax/kqv sequence), 1 = --m4-kqkv (explicit; needs --gpu-core).
-    // H3/U11 — the two remaining attention phases, TRI-STATE with the same shape as m4_wkb /
-    // m4_kqkv: -1 = AUTO (ON wherever it applies, i.e. --gpu-core), 0 = --no-<x> (the reference
-    // op sequence, byte-identical to the pre-H3-U11 binary), 1 = explicit (needs --gpu-core).
-    int    m4_kvwrite = -1;  // kvwrite: wkv_a gemv + kv_a_norm + k_pe rope + the cache scatter
-    int    m4_wvb     = -1;  // wvb: the MLA value absorption gemv (`kqv_mla`)
-    // ---- M1/Q1 — THE QUALITY INSTRUMENT's two engine-side surfaces (both default OFF) -----
-    // --score <tokens file>: SCORING mode.  Prefill the file's tokens and then feed the file's
-    // OWN next token instead of the argmax (teacher forcing), dumping ONE logits row per
-    // position that has a target (<out>.tokens then carries the TARGET ids, not generated
-    // ones).  Same forward path, same kernels, same flags as a decode run — a score run
-    // measures exactly the computation the product does.  The decode loop's position mapping
-    // (ref_pos0 = n_prompt-1) does NOT apply here; --ref/--ref-tokens are refused.
-    std::string score_tokens;
-    // --damage <tensor suffix> <eps>: CALIBRATION ONLY — scale one named F32 layer tensor by
-    // (1+eps) as it is uploaded (see m1_set_damage).  Empty name => off.  The dose ladder in
-    // results/q1.md is the instrument's proof that it CAN see a real degradation.
-    std::string damage_tensor;
-    double      damage_eps = 0.0;
-};
+// struct LoopArgs lives in engine/m1_session.h (U4): the m1 binary and the server fill ONE
+// argument set, so there is no mapping layer between them and no second definition to drift.
+
+
 
 // U4b — the serial-tail decomposition of the token loop (plan §Q6 open question 5): where one
 // token's time goes.  Timing ONLY — the op order and the numerics are untouched, so the
@@ -1176,6 +1047,18 @@ static long   n_vram_graphs = 0, n_vram_experts = 0, n_vram_hist[N_USED + 1] = {
 // keeps its meaning and its VRAM size while the COMPOSITION of the resident set changes.
 static FILE * g_rdump = nullptr;
 static const int32_t * g_perm = nullptr;   // 36 x 128, row l = new fixture id of expert e
+// U4 — THE SESSION CARVE's additions to this block, both file-`static` for the plan §A reason
+// (per-run instrumentation/configuration that no deciding path inside the session reads):
+//   * g_perm_staging: --route-perm's parse lives in loop_run (its refusals must precede any model
+//     load), but the parsed table belongs to the SESSION (M1Session::perm_storage, which open()
+//     adopts), and g_perm points at the session's copy for the rest of the run.
+//   * t_build1: the build phase's end, taken in open() and read by loop_run's "# U2b phases" print.
+//   * g_m4_on / g_kqkv_on / g_kvwrite_on / g_wvb_on: the TRI-STATE custom-op hatches RESOLVED in
+//     loop_run's validation block (AUTO => on iff --gpu-core).  The layer build runs inside open()
+//     and the post-loop core probe in loop_run, so the resolved value must be visible in both.
+static std::vector<int32_t> g_perm_staging;
+static double t_build1 = 0;
+static bool   g_m4_on = false, g_kqkv_on = false, g_kvwrite_on = false, g_wvb_on = false;
 // U4c — the GPU-core staging cost (timing only): the per-layer input H2D (set_input) and the
 // per-layer result D2H (the five graph taps the store arm reads back).  On the CPU backend these
 // are memcpy-scale; on ROCm0 each blocking transfer carries its sync latency, and the loop's
@@ -2084,221 +1967,93 @@ static void attn_bisection_run(GGUFModel & m, ggml_backend_t gpu, int64_t kv_max
                 "comparable to the once delta.\n");
 }
 
-static int loop_run(const LoopArgs & a) {
-    const bool scoring = !a.score_tokens.empty();   // M1/Q1: scoring mode (teacher forcing)
-    std::vector<int32_t> ids;
-    int n_prompt = 0;
-    if (!read_tokens((scoring ? a.score_tokens : a.tokens).c_str(), ids, n_prompt)) return 1;
-    if (scoring) {
-        // The scoring corpus is the WHOLE file, and its header's count must agree with the ids
-        // it carries: a corpus file whose header disagrees with its body is exactly the kind of
-        // silent drift the manifest exists to prevent.
-        if (n_prompt != (int) ids.size()) {
-            std::printf("FAIL: --score %s: header says n_prompt=%d but the file carries %zu ids; "
-                        "the scoring mode feeds the WHOLE file and needs them equal\n",
-                        a.score_tokens.c_str(), n_prompt, ids.size());
-            return 1;
-        }
-        if (ids.size() < 2) {
-            std::printf("FAIL: --score %s: %zu token(s) — needs >= 2 to score one position\n",
-                        a.score_tokens.c_str(), ids.size());
-            return 1;
-        }
-        // The reference dumps are indexed by the DECODE mapping (ref_pos0 = n_prompt-1); the
-        // score loop's rows are indexed from 0, so a --ref here would compare the wrong rows.
-        // Refuse rather than silently compare across two mappings.
-        if (!a.ref.empty() || !a.ref_tokens.empty()) {
-            std::printf("FAIL: --score with --ref/--ref-tokens: the score loop's row indices are "
-                        "NOT the decode mapping (ref_pos0 = n_prompt-1), so a reference "
-                        "comparison would be off by n_prompt-1 rows — run the two separately\n");
-            return 1;
-        }
-    }
-    if (!a.damage_tensor.empty()) {
-        m1_set_damage(a.damage_tensor.c_str(), a.damage_eps);
-        std::printf("# DAMAGE PROBE = '%s' x (1 + %.17g) at load — CALIBRATION ONLY; every number "
-                    "below is a damaged model, not a product number\n",
-                    a.damage_tensor.c_str(), a.damage_eps);
-    }
-    if (a.n_decode < 1 && !scoring) { std::printf("FAIL: --n-decode %d\n", a.n_decode); return 1; }
-    if (n_prompt < 1 && !scoring)   { std::printf("FAIL: %s has an empty prompt (n_prompt %d)\n", a.tokens.c_str(), n_prompt); return 1; }
-    const int n_total = scoring ? (int) ids.size() : n_prompt + a.n_decode;
-    const int kv_max  = a.kv_max > 0 ? a.kv_max : n_total;
-    if (kv_max < n_total) {
-        std::printf("FAIL: --kv-max %d < %d positions — the KV cache cannot hold the sequence\n", kv_max, n_total);
-        return 1;
-    }
-    const int ref_pos0 = n_prompt - 1;   // the -ub 1 chunk mapping, asserted below
+// ---------------------------------------------------------------------------
+// U4 — THE SESSION (aubier server plan §A).  The engine state a run BUILDS ONCE and then drives
+// one position at a time.  Every field below was loop_run's own state (the setup block) or a
+// file-static the per-position body read; the list is the plan §A list plus what the carve FORCED
+// (the reference dumps and the boot rotation membership, whose readers live in the tail).
+// ---------------------------------------------------------------------------
+struct M1Session {
+    GGUFModel * m = nullptr;                       // the GGUF mmap (alive for the whole session)
+    ggml_backend_t cpu = nullptr, gpu = nullptr;   // gpu = ROCm0, only with --gpu-store/--gpu-core
+    ggml_backend_t core_be = nullptr;              // where emb/head/the layer cores run
+    EmbGraph emb;
+    HeadGraph head;
+    std::vector<std::unique_ptr<M1Layer>> layer_own;   // the 36 layers (their ggml buffers)
+    std::vector<LoopLayer> L;                          // their per-token buffers + store lists
+    std::vector<float> x;                              // H_DIM: the residual carrier between steps
+    int  n_build_layers = 0;
+    int  kv_max = 0;
+    bool rotate = false;                           // --rotate was armed (the reset's guard)
+    // U6's per-layer id permutation: ADOPTED from the parser's staging in open(); g_perm points at
+    // THIS vector for the rest of the run (it used to be loop_run's function-local static).
+    std::vector<int32_t> perm_storage;
+    // U2b — the BOOT VRAM membership per layer: what reset_rotation() replays the membership back
+    // to.  The store split changes the float accumulation grouping, so a different membership is a
+    // different rounding (plan §E).
+    std::vector<std::vector<int>> rot_initial;
+    // TIER A — the reference's own dumps.  Parsed in open() (the block that prints "# reference"),
+    // read per position by the loop and once more in the tail: state, not a local.
+    RefDump ref;
+    RefLogits rlog;
+    bool have_ref = false, have_rlog = false;
 
-    // ---- U6: the routing trace + the treatment's id permutation -----------------------
-    // --route-perm: 36 lines "<l> <128 ints>"; entry e of line l = the PERMUTED FIXTURE id
-    // that carries original expert e's weights.  Applied to the store arm's read-back ids
-    // (post-taps, pre-enqueue) only; the router itself is untouched, so its own selection
-    // is bit-identical to the control's by construction.
-    static std::vector<int32_t> perm_storage;   // backs g_perm for the whole run
-    if (!a.route_perm.empty()) {
-        CHECK(a.do_store, "--route-perm maps the STORE arm's read-back ids; it needs --arm-store");
-        CHECK(!a.falsify, "--route-perm is not wired into the falsifier path (and must not be)");
-        // FINDING-1 (H1's review): --route-perm maps routed ids to PERMUTED FIXTURE ids while
-        // --resident-set names ORIGINAL ids, so the set store's membership test would miss almost
-        // every routed expert and serve it from RAM — silently wrong bytes, exit 0.  Refuse.
-        CHECK(a.res_hot.empty(),
-              "--route-perm maps routed ids to PERMUTED FIXTURE ids and --resident-set names ORIGINAL ids: "
-              "combined they silently serve the wrong experts (exit 0) — refusing (U6's idiom was "
-              "fixture+perm; H1's is the set)");
-        FILE * f = std::fopen(a.route_perm.c_str(), "r");
-        CHECK(f, "cannot open --route-perm %s", a.route_perm.c_str());
-        perm_storage.assign((size_t) N_LAYERS * (size_t) N_EXPERT, -1);
-        char line[4096];
-        int rows = 0;
-        while (std::fgets(line, sizeof line, f)) {
-            if (line[0] == '#' || line[0] == '\n') continue;
-            int l;
-            char * p = line;
-            int got = std::sscanf(p, "%d", &l);
-            CHECK(got == 1 && l == rows && l >= 0 && l < (int) N_LAYERS,
-                  "route-perm row %d malformed (expected layer %d)", rows, rows);
-            p = std::strchr(line, ' ');
-            for (int e = 0; e < (int) N_EXPERT; ++e) {
-                CHECK(p != nullptr, "route-perm row %d: only %d entries", rows, e);
-                perm_storage[(size_t) l * N_EXPERT + e] = std::strtol(p, &p, 10);
-                p = std::strchr(p, ' ');
-            }
-            ++rows;
-        }
-        std::fclose(f);
-        CHECK(rows == (int) N_LAYERS, "route-perm has %d rows, expected %d", rows, (int) N_LAYERS);
-        for (int l = 0; l < (int) N_LAYERS; ++l) {
-            uint64_t seen[2] = { 0, 0 };   // 128-bit membership: ids run to 127, so a 32-bit
-            for (int e = 0; e < (int) N_EXPERT; ++e) {   // mask would collide (measured: 1u<<50 wraps to bit 18)
-                const int32_t v = perm_storage[(size_t) l * N_EXPERT + e];
-                CHECK(v >= 0 && v < (int) N_EXPERT, "route-perm row %d entry %d = %d out of range", l, e, v);
-                CHECK(!((seen[v >> 6] >> (v & 63)) & 1), "route-perm row %d: id %d appears twice", l, v);
-                seen[v >> 6] |= 1ull << (v & 63);
-            }
-            CHECK(seen[0] || seen[1], "route-perm row %d empty", l);   // (the dup+range checks above
-                                                                       // already force a full permutation)
-        }
-        g_perm = perm_storage.data();
-    }
-    if (!a.route_dump.empty()) {
-        CHECK(!a.falsify, "--route-dump is not wired into the falsifier path");
-        g_rdump = std::fopen(a.route_dump.c_str(), "w");
-        CHECK(g_rdump, "cannot open --route-dump %s", a.route_dump.c_str());
-        static char rdbuf[1 << 20];   // setvbuf holds the pointer for the whole run
-        std::setvbuf(g_rdump, rdbuf, _IOFBF, sizeof rdbuf);
-        std::fprintf(g_rdump, "# M1/U6 route trace: R <layer> <pos> <sel0..3 = the router's OWN ids, PRE-permutation> <w0..w3>\n");
-    }
+    bool open(const LoopArgs & a);
+    bool step(int32_t tok, int pos, float * logits_row);
+    void reset_rotation();
+    void close();
+};
 
-    // U7: the per-position split (timing only) + its empty-store probe.  Both are instrument
-    // flags, never the correctness path; the split cannot be combined with the falsifier (whose
-    // verdict is a paired timing statistic this instrumentation would perturb).
-    g_instr = a.instr;
-    g_core_nodes = a.core_nodes;   // H3/U2
-    g_res_stats = a.res_stats;   // H1: the served-slot counter (one branch per layer; timing-neutral)
-    g_store_pull_at_drain = a.store_pull_at_drain;   // U7 A/B arm (numerics-neutral: same bytes)
-    if (a.instr) {
-        CHECK(a.do_store, "--instr splits the STORE DRIVE; it needs --arm-store");
-        CHECK(!a.falsify, "--instr is not wired into the falsifier path (and must not be)");
-    }
-    if (a.extra_stores) {
-        CHECK(a.do_store, "--extra-stores needs --arm-store (it extends the store list)");
-        CHECK(!a.falsify, "--extra-stores is not wired into the falsifier path");
-        CHECK(a.extra_stores > 0 && a.extra_stores <= 64, "--extra-stores %d out of range", a.extra_stores);
-    }
-    // H3/U1: the core probe times the core GRAPH on the core backend; it needs the gpu-core
-    // configuration it is meant to explain, and it must not sit in the falsifier's timing path.
-    if (a.core_probe) {
-        CHECK(a.gpu_core, "--core-probe needs --gpu-core (the core graph runs on ROCm0)");
-        CHECK(!a.falsify, "--core-probe is not wired into the falsifier path");
-        CHECK(a.probe_reps > 0 && a.probe_reps <= 2000, "--probe-reps %d out of range", a.probe_reps);
-        CHECK(a.probe_gap_us >= 0 && a.probe_gap_us <= 100000, "--probe-gap-us %d out of range",
-              a.probe_gap_us);
-    }
-    // H3/U2: the fused attention expression is asserted only for the GPU-core arm, so the
-    // CPU-only correctness path (gate1's oracle) keeps the reference expansion BY CONSTRUCTION
-    // — the flag cannot reach it.
-    if (a.core_fuse >= 0) {
-        CHECK(a.core_fuse >= 0 && a.core_fuse <= 1, "--core-fuse %d out of range [0,1]", a.core_fuse);
-        CHECK(a.gpu_core, "--core-fuse is GPU-core only: the CPU-only arm must keep the reference "
-              "expansion (it is the numerics oracle)");
-        CHECK(!a.falsify, "--core-fuse is not wired into the falsifier path");
-    }
-    // H3/U4: the custom-op hatch is GPU-core-only (the CPU arm is the numerics oracle) and is
-    // NOT wired into the falsifier path (the falsifier times the STORE list's overlap, a
-    // configuration where the core's absorption kernel is not the quantity under test).
-    const bool m4_on = (a.m4_wkb < 0) ? a.gpu_core : (a.m4_wkb == 1);   // AUTO = on iff the core is on GPU
-    if (a.m4_wkb == 1) {
-        CHECK(a.gpu_core, "--m4-wkb needs --gpu-core (the CPU-only arm must keep the reference "
-              "mul_mat — it is the numerics oracle)");
-    }
-    if (m4_on) CHECK(!a.falsify, "--m4-wkb is not wired into the falsifier path");
-    // H3/U5: the fused attention-core hatch follows the SAME rule as m4_wkb — GPU-core-only
-    // (the CPU arm is the numerics oracle) and not wired into the falsifier path.
-    const bool kqkv_on = (a.m4_kqkv < 0) ? a.gpu_core : (a.m4_kqkv == 1);   // AUTO = on iff the core is on GPU
-    if (a.m4_kqkv == 1) {
-        CHECK(a.gpu_core, "--m4-kqkv needs --gpu-core (the CPU-only arm must keep the reference "
-              "kq/softmax/kqv sequence — it is the numerics oracle)");
-    }
-    if (kqkv_on) CHECK(!a.falsify, "--m4-kqkv is not wired into the falsifier path");
-    // H3/U11: the two remaining phase fusions follow the SAME rule (GPU-core-only, not wired
-    // into the falsifier path).  TRI-STATE rather than bool for the L59 reason: a default that
-    // is only legal with --gpu-core must not fire its own guard on the legal CPU-only run.
-    const bool kvw_on = (a.m4_kvwrite < 0) ? a.gpu_core : (a.m4_kvwrite == 1);
-    if (a.m4_kvwrite == 1) {
-        CHECK(a.gpu_core, "--m4-kvwrite needs --gpu-core (the CPU-only arm must keep the reference "
-              "KV write — it is the numerics oracle)");
-    }
-    if (kvw_on) CHECK(!a.falsify, "--m4-kvwrite is not wired into the falsifier path");
-    const bool wvb_on = (a.m4_wvb < 0) ? a.gpu_core : (a.m4_wvb == 1);
-    if (a.m4_wvb == 1) {
-        CHECK(a.gpu_core, "--m4-wvb needs --gpu-core (the CPU-only arm must keep the reference "
-              "wv_b mul_mat — it is the numerics oracle)");
-    }
-    if (wvb_on) CHECK(!a.falsify, "--m4-wvb is not wired into the falsifier path");
-    if (a.core_nodes) CHECK(a.instr, "--core-nodes needs --instr");
+// THE BOOT PROMPT'S VIEW (declared in m1_session.h).  The configuration block's three prompt lines
+// are printed by open() so both binaries print that block from one place; the prompt itself belongs
+// to the CALLER (the m1 binary's token file, the server's request), so it is published here as a
+// view and read by those three prints only — no engine path reads it.
+static const std::vector<int32_t> * g_boot_ids = nullptr;
+static int  g_boot_n_prompt = 0, g_boot_n_total = 0;
+static bool g_boot_scoring = false;
 
-    // U8: the fold is only meaningful when the core graph and the resident store share ONE
-    // backend (else the resident weights are not on the core backend and the mul_mat_id cannot
-    // reference them).  The falsifier times the STORE list's overlap — a configuration the fold
-    // deletes — so the two are never combined.
-    if (a.fold_resident) {
-        CHECK(a.do_store, "--fold-resident needs --arm-store (it replaces the VRAM store's slice)");
-        CHECK(a.gpu_core && a.gpu_store,
-              "--fold-resident needs --gpu-core AND --gpu-store: the fold runs the resident MoE "
-              "inside the core graph, so the core and the resident experts must share the ROCm0 backend");
-        CHECK(!a.falsify, "--fold-resident is not wired into the falsifier path (the falsifier times "
-              "the store list the fold deletes)");
-    }
-    // U9: the slot-count A/B is a fold-mode timing knob only.
-    if (a.fold_slots >= 0) {
-        CHECK(a.fold_resident, "--fold-slots overrides the fold's resident block; it needs --fold-resident");
-        CHECK(!a.falsify, "--fold-slots is a timing A/B; it is not wired into the falsifier path");
-        CHECK(a.fold_slots <= (int) N_USED, "--fold-slots %d out of range [0,%d]", a.fold_slots, (int) N_USED);
-    }
-    // H1 — the resident SET replaces the store list's INTERVAL membership, so it needs the store
-    // arm.  It is NOT wired into the retired resident fold: that fold deletes the VRAM
-    // store, and a set with no store to hold it would be a silent no-op — refuse instead.
-    if (!a.res_hot.empty()) {
-        CHECK(a.do_store, "--resident-set sets the STORE LIST's membership; it needs --arm-store");
-        CHECK(!a.fold_resident, "--resident-set is not wired into the retired resident fold — "
-                               "the fold has no VRAM store to hold the set");
-    }
+void m1_session_boot_prompt(const std::vector<int32_t> * ids, int n_prompt, int n_total, bool scoring) {
+    g_boot_ids = ids; g_boot_n_prompt = n_prompt; g_boot_n_total = n_total; g_boot_scoring = scoring;
+}
 
-    GGUFModel * m = GGUFModel::load(a.model.c_str());
+// THE STATE CONSTRUCTION — m1_engine.cpp's setup block, moved here statement for statement.  What
+// changed and nothing else: the locals that are now fields lost their declarations, the two
+// refusal paths call close() instead of leaking, and the prompt lines come from the published view.
+bool M1Session::open(const LoopArgs & a) {
+    // U4FIX item 3a: the KV width.  `--kv-max <= 0` is U2's PRE-FIX width = the number of positions
+    // the caller intends to walk.  Three sources, in this order: the flag, the per-session
+    // LoopArgs::seq_len the header documents (so a caller needs no global), and the boot prompt the
+    // caller published (how the m1 binary supplies it: n_prompt + n_decode, or the whole scoring
+    // file).  `m1_session_open` FATALs when none of them names a width — a session cannot size a KV
+    // cache from nothing — which is why the header says "refused" only for the paths that print a
+    // FAIL line and return false.
+    kv_max = a.kv_max > 0 ? a.kv_max
+                         : (a.seq_len > 0 ? a.seq_len : g_boot_n_total);
+    CHECK(kv_max > 0, "open: kv_max could not be resolved -- --kv-max %d, LoopArgs::seq_len %d, "
+          "published boot length %d (a caller with no boot prompt must pass --kv-max or seq_len)",
+          a.kv_max, a.seq_len, g_boot_n_total);
+    perm_storage = std::move(g_perm_staging);
+    if (!perm_storage.empty()) g_perm = perm_storage.data();
+    m = GGUFModel::load(a.model.c_str());
 
     std::printf("=== M1 / U3 — THE 36-LAYER TOKEN LOOP ===\n");
     std::printf("# model      = %s\n", m->path.c_str());
-    if (scoring)
-        std::printf("# SCORE      = %s : %d tokens -> %d scored positions (teacher forcing: position"
-                    " p feeds ids[p], its row predicts ids[p+1])\n",
-                    a.score_tokens.c_str(), n_total, n_total - 1);
-    else
-        std::printf("# tokens     = %s : n_prompt=%d + n_decode=%d = %d positions\n",
-                    a.tokens.c_str(), n_prompt, a.n_decode, n_total);
-    std::printf("# ids        = [%d", ids[0]);
-    for (int i = 1; i < (int) ids.size() && i < 12; ++i) std::printf(" %d", ids[i]);
-    std::printf("%s]\n", ids.size() > 12 ? " ..." : "");
+    // The three prompt lines come from the view the CALLER published before open() (the m1
+    // binary's token file); a caller with no boot prompt (the server, whose prompt is per request)
+    // gets the configuration block without them.  Same prints, same order, one place.
+    if (g_boot_ids) {
+        const std::vector<int32_t> & ids = *g_boot_ids;
+        if (g_boot_scoring)
+            std::printf("# SCORE      = %s : %d tokens -> %d scored positions (teacher forcing: position"
+                        " p feeds ids[p], its row predicts ids[p+1])\n",
+                        a.score_tokens.c_str(), g_boot_n_total, g_boot_n_total - 1);
+        else
+            std::printf("# tokens     = %s : n_prompt=%d + n_decode=%d = %d positions\n",
+                        a.tokens.c_str(), g_boot_n_prompt, a.n_decode, g_boot_n_total);
+        std::printf("# ids        = [%d", ids[0]);
+        for (int i = 1; i < (int) ids.size() && i < 12; ++i) std::printf(" %d", ids[i]);
+        std::printf("%s]\n", ids.size() > 12 ? " ..." : "");
+    }
     std::printf("# layers     = %d (all) x (attention+MLA+KV+router+MoE+shexp)\n", (int) N_LAYERS);
     std::printf("# kv width   = %d%s\n", kv_max,
                 a.kv_max > 0 ? "  (pinned: the reference's KV-cache pad, llama-kv-cache.cpp:1285)"
@@ -2313,7 +2068,7 @@ static int loop_run(const LoopArgs & a) {
         std::printf("# attention  = %s\n", m1_attn_params_str(buf, sizeof buf));
     }
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    cpu = ggml_backend_cpu_init();
     CHECK(cpu, "cpu backend init failed");
     ggml_backend_cpu_set_n_threads(cpu, a.threads);
     g_store_cpu_be = cpu;    // U7: so the store-side split can name the RAM (CPU) store
@@ -2324,12 +2079,46 @@ static int loop_run(const LoopArgs & a) {
     // ranges on it, --gpu-core builds/runs the layer core + embedding + head on it.  The two
     // are INDEPENDENT (core-on-GPU with every store on the CPU is a meaningful configuration
     // and is measured); the CPU-only configuration (both off) is the correctness path.
-    ggml_backend_t gpu = nullptr;
     if (a.gpu_store || a.gpu_core) {
         gpu = ggml_backend_cuda_init(0);
         CHECK(gpu, "gpu (ROCm0) backend init failed");
     }
-    ggml_backend_t core_be = a.gpu_core ? gpu : cpu;   // where the layer core + emb + head run
+    core_be = a.gpu_core ? gpu : cpu;   // where the layer core + emb + head run
+
+    // ---- THE ONE RESOLUTION OF THE TRI-STATE CORE-OP HATCHES (U4FIX item 1) -------------------
+    // H3/U4, H3/U5, H3/U11: each hatch is TRI-STATE (-1 AUTO = on iff the core runs on ROCm0,
+    // 0 = the reference op sequence, 1 = explicit) and each is GPU-core-only, because the CPU-only
+    // arm is the numerics oracle gate1 compares byte for byte.  They are resolved HERE, where the
+    // layer build that consumes them happens, and published for the two readers that live outside
+    // this function (loop_run's post-loop core probe; nothing else).  Resolving them in a caller
+    // would leave every other caller building the stock sequence while still printing
+    // "# gpu core = ON" — measured at +0.199 % perplexity (results/q1.md:381-408).
+    g_m4_on      = (a.m4_wkb     < 0) ? a.gpu_core : (a.m4_wkb     == 1);   // AUTO = on iff on GPU
+    g_kqkv_on    = (a.m4_kqkv    < 0) ? a.gpu_core : (a.m4_kqkv    == 1);
+    g_kvwrite_on = (a.m4_kvwrite < 0) ? a.gpu_core : (a.m4_kvwrite == 1);
+    g_wvb_on     = (a.m4_wvb     < 0) ? a.gpu_core : (a.m4_wvb     == 1);
+    if (a.m4_wkb == 1)
+        CHECK(a.gpu_core, "--m4-wkb needs --gpu-core (the CPU-only arm must keep the reference "
+              "mul_mat — it is the numerics oracle)");
+    if (g_m4_on) CHECK(!a.falsify, "--m4-wkb is not wired into the falsifier path");
+    if (a.m4_kqkv == 1)
+        CHECK(a.gpu_core, "--m4-kqkv needs --gpu-core (the CPU-only arm must keep the reference "
+              "kq/softmax/kqv sequence — it is the numerics oracle)");
+    if (g_kqkv_on) CHECK(!a.falsify, "--m4-kqkv is not wired into the falsifier path");
+    if (a.m4_kvwrite == 1)
+        CHECK(a.gpu_core, "--m4-kvwrite needs --gpu-core (the CPU-only arm must keep the reference "
+              "KV write — it is the numerics oracle)");
+    if (g_kvwrite_on) CHECK(!a.falsify, "--m4-kvwrite is not wired into the falsifier path");
+    if (a.m4_wvb == 1)
+        CHECK(a.gpu_core, "--m4-wvb needs --gpu-core (the CPU-only arm must keep the reference "
+              "wv_b mul_mat — it is the numerics oracle)");
+    if (g_wvb_on) CHECK(!a.falsify, "--m4-wvb is not wired into the falsifier path");
+    // The same argument for the four IN-LOOP INSTRUMENTATION gates (U4FIX item 7): they are read by
+    // the layer build below and by forward(), so they are assigned here, not by the caller.
+    g_instr              = a.instr;
+    g_core_nodes         = a.core_nodes;
+    g_res_stats          = a.res_stats;
+    g_store_pull_at_drain = a.store_pull_at_drain;
     if (a.gpu_core) {
         std::printf("# gpu core   = ON — the layers' non-expert surface (attention/MLA/router/shexp\n"
                     "#               weights + KV + inputs + intermediates) and embedding+head live and\n"
@@ -2370,9 +2159,6 @@ static int loop_run(const LoopArgs & a) {
     print_loadavg("at start");
 
     // ---- tier A ----------------------------------------------------------------------
-    RefDump   ref;
-    RefLogits rlog;
-    bool have_ref = false, have_rlog = false;
     if (!a.ref.empty()) {
         have_ref  = ref.parse(a.ref.c_str());
         have_rlog = rlog.parse(a.ref.c_str());
@@ -2385,8 +2171,8 @@ static int loop_run(const LoopArgs & a) {
                 std::printf("FAIL: the reference reduces over width %d, this run uses %d "
                             "(llama-kv-cache.cpp:1285 — the width is the reference's padded cache, "
                             "not a flag; U2b/U2c)\n", rw, kv_max);
-                delete m;
-                return 1;
+                close();
+                return false;
             }
         } else {
             std::printf("# NOTE: the reference dump carries no kq_soft_max shape line (unpatched "
@@ -2396,7 +2182,7 @@ static int loop_run(const LoopArgs & a) {
                     ref.n_evals, ref.n_dec_steps, (int) rlog.v.size());
         std::printf("# position mapping: ref step k <-> position %d+k  (the prompt is %d single-token "
                     "ubatches landing in ONE chunk; last-write-wins) — controlled by the logits line below\n",
-                    ref_pos0, n_prompt);
+                    g_boot_n_prompt - 1, g_boot_n_prompt);
         if (rlog.n_vocab) std::printf("# reference n_vocab = %d\n", rlog.n_vocab);
     } else {
         std::printf("# TIER A: not run (no --ref).  The token line then has NO external instrument.\n");
@@ -2450,11 +2236,12 @@ static int loop_run(const LoopArgs & a) {
     // ---- the graphs -----------------------------------------------------------------
     // U4c: --gpu-core builds the embedding and the head on the core backend too (and the
     // layers below); without the flag this line is the unchanged CPU build.
-    EmbGraph emb;
+    // U4: `emb` and `head` are SESSION FIELDS (the public header's configuration block and every
+    // position read them), so they are built in place here — NOT as locals that would die with
+    // this function and leave step() with null tensors.
     emb.build(*m, core_be);
-    HeadGraph head;
     head.build(*m, core_be);
-    const int n_build_layers = a.falsify ? a.f_layers : (int) N_LAYERS;
+    n_build_layers = a.falsify ? a.f_layers : (int) N_LAYERS;
     std::printf("# head       = output_norm (f32, rms) -> output.weight (q4_K) x %lld = %lld logits\n",
                 (long long) head.n_vocab, (long long) head.n_vocab);
 
@@ -2463,8 +2250,10 @@ static int loop_run(const LoopArgs & a) {
     g_audit_full     = a.audit_full;       // U10: the refresh audit's scope
     g_rot_admit_k    = a.rot_admit_k;      // U10: the 2Q window's threshold (default 2)
     const double t_build0 = now_s();   // U2b: the phase split (build | loop | tail), --instr only
-    std::vector<std::unique_ptr<M1Layer>> layer_own;
-    std::vector<LoopLayer> L((size_t) n_build_layers);
+    L.resize((size_t) n_build_layers);
+    // U4: the residual carrier between steps (loop_run's own local before the carve).  It lives in
+    // the session because step() writes it and the post-loop core probe reads it.
+    x.assign((size_t) H_DIM, 0.0f);
     size_t vram_bytes = 0;      // the split's resident expert bytes (U4a: does it fit?)
     size_t core_bytes = 0;      // U4c: the core's resident bytes (layer bufs + emb + head)
     // H2/U1: the PACKED-COPY accounting (see LoopArgs::footprint) — the bytes each location
@@ -2483,8 +2272,8 @@ static int loop_run(const LoopArgs & a) {
                   // H3/U2: the GPU path only — the CPU-only arm keeps the reference expansion
                   // (it is the numerics oracle gate1 compares byte for byte).
                   /*attn_expr*/ a.gpu_core ? (a.core_fuse < 0 ? 1 : a.core_fuse) : 0,
-                  /*m4_wkb*/ m4_on, /*m4_kqkv*/ kqkv_on,
-                  /*m4_kvwrite*/ kvw_on, /*m4_wvb*/ wvb_on);
+                  /*m4_wkb*/ g_m4_on, /*m4_kqkv*/ g_kqkv_on,
+                  /*m4_kvwrite*/ g_kvwrite_on, /*m4_wvb*/ g_wvb_on);
         std::vector<Store *> keep;
         if (a.do_store) {
             // H1: the layer's ORDERED resident set (nullptr => the identity interval [0,n_res),
@@ -2552,7 +2341,7 @@ static int loop_run(const LoopArgs & a) {
     }
     if (a.gpu_core) core_bytes += ggml_backend_buffer_get_size(emb.buf)
                                 + ggml_backend_buffer_get_size(head.buf);
-    const double t_build1 = now_s();
+    t_build1 = now_s();
     std::printf("# built      = %d layer(s) + embedding + head; store entries/layer = %d\n",
                 n_build_layers, L.empty() ? 0 : (int) L[0].stores.size());
     // M1/Q1: a damage suffix that matched nothing would leave a "damaged" run that is in fact
@@ -2565,7 +2354,8 @@ static int loop_run(const LoopArgs & a) {
             std::printf("FAIL: --damage '%s' matched NO layer tensor — nothing was damaged, so "
                         "this run is the UNDAMAGED model wearing a damage label\n",
                         a.damage_tensor.c_str());
-            return 1;
+            close();
+            return false;
         }
     }
     if (g_instr)
@@ -2616,10 +2406,25 @@ static int loop_run(const LoopArgs & a) {
         std::printf("# rotate     = 2Q ADMISSION CONTROL: a ghost bit per expert is set on the 1st "
                     "reference of a non-resident expert and ADMITS it on the 2nd; the victim is the "
                     "LRU slot this position does not route to.\n");
+        // U4: the BOOT VRAM membership per layer — what m1_session_reset_rotation() replays the
+        // membership back to (plan §E: the store split changes the float accumulation grouping, so
+        // a different membership is a different rounding and the chain is chaotic past ~100
+        // positions).  Captured here, i.e. at the only moment the boot state exists.
+        rot_initial.assign((size_t) n_build_layers, {});
+        for (int l = 0; l < n_build_layers; ++l) {
+            Store * vram = nullptr;
+            for (Store * st : L[(size_t) l].stores) if (st->loc == Store::VRAM) { vram = st; break; }
+            CHECK(vram, "U4: layer %d's boot membership could not be recorded (no VRAM entry)", l);
+            rot_initial[(size_t) l] = vram->members;
+        }
+        rotate = true;
         std::printf("# rotate grid = %d slots/layer, ghost window = %d experts/layer, refresh = a "
                     "membership swap (VRAM row write + alias predicate flip) applied at the NEXT "
                     "position's forward entry, before that layer's enqueue\n",
                     L[0].rot.vram ? L[0].rot.vram->n_e : 0, (int) N_EXPERT);
+        std::printf("# rotate verify = %s (every refreshed slot read back and memcmp'd%s)\n",
+                    g_rotate_verify ? "ON" : "off",
+                    g_rotate_verify ? "; the per-request RESET's replayed slots too" : "");
     }
     if (a.gpu_store || a.gpu_core)
         std::printf("# resident VRAM = %.2f GiB (stores %.2f + core %.2f: %d layer buffer(s) + emb + head, "
@@ -2671,6 +2476,440 @@ static int loop_run(const LoopArgs & a) {
         std::printf("# process memory = VmRSS %.3f GiB (RssAnon %.3f + RssFile %.3f GiB)\n",
                     rss / (1024.0*1024.0), anon / (1024.0*1024.0), rssfile / (1024.0*1024.0));
     }
+    // U4FIX item 6: the boot-prompt view pointed into the CALLER's vector and was documented to be
+    // dead after this call.  Clear it, or a second open() in this process re-prints a possibly freed
+    // prompt (it reads ids[0]).
+    g_boot_ids = nullptr; g_boot_n_prompt = 0; g_boot_n_total = 0; g_boot_scoring = false;
+    return true;
+}
+
+// THE PER-POSITION BODY — m1_engine.cpp:2855-2891 before the carve, unchanged in order: the
+// embedding, 36 layers, and (when the caller wants a row) the head.  `logits_row == nullptr` skips
+// the head exactly where the single-shot binary skipped it.
+bool M1Session::step(int32_t tok, int pos, float * logits_row) {
+    if (!m || L.empty()) return false;
+    // U4FIX item 3b: THE POSITION BOUND.  forward() uses pos as the KV cell to write (kidx = pos,
+    // nkv = pos + 1), so pos >= kv_max writes PAST the kcache tensor, and the attention mask covers
+    // only [nkv, n_kv_max) — i.e. the old structural `kv_max >= n_total` guard became a caller
+    // contract, and violating it yielded a silently wrong row (plus an out-of-bounds KV write)
+    // rather than an error.  The session REFUSES instead: false, with the reason on stderr, so a
+    // server can answer 400/500 rather than serve garbage or die.
+    if (pos < 0 || pos >= kv_max) {
+        std::fprintf(stderr, "FAIL: m1_session_step: pos %d outside [0,%d) — the run's KV width "
+                     "is exceeded; refusing rather than writing past the cache and attending a "
+                     "zero mask\n", pos, kv_max);
+        return false;
+    }
+    const double te0 = now_s();
+    emb.run(core_be, tok, x.data());
+    t_emb_acc += now_s() - te0;
+    // `L.size()`, not N_LAYERS: --falsify builds only a.f_layers of them (U4FIX item 8).
+    for (size_t l = 0; l < L.size(); ++l) {
+        L[l].forward(cpu, pos, pos + 1, x.data());
+        x = L[l].l_out;
+    }
+    if (!logits_row) return true;
+    const double th0 = now_s();
+    head.run(core_be, x.data(), logits_row);
+    t_head_acc += now_s() - th0;
+    ++n_head_calls;
+    return true;
+}
+
+// PER-REQUEST RESET (plan §E) — the rotation policy back to its boot state, and the VRAM membership
+// back to the boot permutation.  The KV cache needs no reset: forward() masks every cell >= the live
+// length, so a stale cell is unreadable by construction.
+void M1Session::reset_rotation() {
+    if (!rotate) return;
+    CHECK(rot_initial.size() == L.size(),
+          "U4 reset: the boot membership has %zu layer(s), the session %zu", rot_initial.size(), L.size());
+    for (size_t l = 0; l < L.size(); ++l) {
+        LoopLayer & ly = L[l];
+        if (!ly.rot.on) continue;
+        Store * vram = ly.rot.vram, * ram = ly.rot.ram;
+        CHECK(vram && ram, "U4 reset: layer %zu lost its rotation pair", l);
+        const std::vector<int> & tgt = rot_initial[l];
+        CHECK((int) tgt.size() == vram->n_e, "U4 reset: layer %zu boot set has %zu members, the store %d",
+              l, tgt.size(), vram->n_e);
+        // (1) THE MEMBERSHIP back to the BOOT SET.  Note what a drifted layer is: NOT a permutation
+        // of the boot membership (a refresh ADMITS an expert that was not in it and EVICTS one that
+        // was), so the wanted expert is often absent from the store entirely and the restore is one
+        // replace_slot — and sometimes present at another slot, where replace_slot REFUSES to admit
+        // it (store.h:592's "already resident" CHECK) and it takes three, through one expert that
+        // lives in the ALIAS (hence outside the VRAM set) as the scratch.  The plan's "at most one
+        // replace_slot per drifted slot" is therefore wrong in the second case (read off
+        // store.h:592 and MEASURED here: the first shipped version assumed it, and the reseam probe
+        // FATAL'd on layer 2 slot 0 with the wanted expert absent).
+        // A slot the loop already fixed is never disturbed: a later slot s2 holding an already-fixed
+        // slot's expert would imply tgt[s2] == tgt[s], i.e. s2 == s (the boot set's entries are
+        // distinct), so s2 is always further down the pass.
+        //
+        // THE SCRATCH IS CHOSEN FOR THE PROPERTY replace_slot ACTUALLY NEEDS (U4FIX item 2): outside
+        // the boot set AND NOT RESIDENT.  "Outside the boot set" alone is not enough — a refresh may
+        // leave ANY non-boot expert resident, and replace_slot refuses to admit a resident expert
+        // (store.h:592), so the old rule could FATAL from engine state alone, inside the per-request
+        // seam, on the second request of a server.  Picking at the point of use makes that
+        // impossible rather than unlikely: at branch-(b) time tgt[s] is itself resident, so at most
+        // 47 of the 48 stores' slots can hold a non-boot expert, i.e. at least 33 of the 80 non-boot
+        // experts are free, and the pick re-tests residency every time it is used.
+        auto pick_scratch = [&]() -> int {
+            for (int e = 0; e < (int) N_EXPERT; ++e) {
+                bool boot = false;
+                for (int m2 : tgt) if (m2 == e) { boot = true; break; }
+                if (!boot && vram->slot((int) l, e) < 0) return e;   // non-boot AND non-resident
+            }
+            return -1;
+        };
+        // U5FIX 3a — WHICH SLOTS THE REPLAY REWROTE. Their rows are read back when --rotate-verify
+        // is on, so the reset's BYTES are measured rather than argued (the refresh path has always
+        // done this; the reset used replace_slot directly and verified nothing).
+        std::vector<int> touched;
+        for (int s = 0; s < (int) tgt.size(); ++s) {
+            if (vram->members[(size_t) s] == tgt[(size_t) s]) continue;
+            const int cur = vram->members[(size_t) s], want = tgt[(size_t) s];
+            const int s2 = vram->slot(ly.ly->layer, want);   // -1 => not resident: one call does it
+            if (s2 < 0) {
+                const int ev = vram->replace_slot(s, want);   // admits want, evicts cur
+                CHECK(ev == cur, "U4 reset: layer %zu slot %d held %d, replace_slot reported %d",
+                      l, s, cur, ev);
+                ram->set_member(want, false);
+                ram->set_member(cur, true);
+                touched.push_back(s);
+                continue;
+            }
+            CHECK(s2 != s, "U4 reset: layer %zu slot %d already holds expert %d", l, s, want);
+            const int scratch = pick_scratch();
+            CHECK(scratch >= 0, "U4 reset: layer %zu has no free expert to use as the scratch "
+                  "(%d non-boot experts, %d of them resident)", l, (int) N_EXPERT - (int) tgt.size(),
+                  (int) N_EXPERT - (int) tgt.size() - 1);
+            // (a) this slot's expert OUT to the alias, the scratch in (temporarily)
+            const int ev = vram->replace_slot(s, scratch);
+            CHECK(ev == cur, "U4 reset: layer %zu slot %d held %d, replace_slot reported %d", l, s, cur, ev);
+            ram->set_member(scratch, false);
+            ram->set_member(cur, true);
+            // (b) the evicted expert into the slot that holds the wanted one — admits cur, evicts want
+            const int ev2 = vram->replace_slot(s2, cur);
+            CHECK(ev2 == want, "U4 reset: layer %zu slot %d held %d, replace_slot reported %d",
+                  l, s2, want, ev2);
+            ram->set_member(cur, false);
+            ram->set_member(want, true);
+            // (c) the wanted expert into this slot; the scratch returns to the alias
+            const int ev3 = vram->replace_slot(s, want);
+            CHECK(ev3 == scratch, "U4 reset: layer %zu slot %d held %d, replace_slot reported %d",
+                  l, s, scratch, ev3);
+            ram->set_member(want, false);
+            ram->set_member(scratch, true);
+            touched.push_back(s);
+            touched.push_back(s2);
+        }
+        // (1b) THE READBACK (U5FIX 3a, --rotate-verify only). verify_slot() synchronizes the store's
+        // stream, reads each row back and memcmps it against the source expert's own bytes AND checks
+        // the source pointers — so a wrong row or a wrong gu_src/d_src after the replay is caught
+        // here instead of being discovered by a divergent token thirty requests later. Cost: two
+        // row reads per TOUCHED slot (<= 48 per layer when everything drifted).
+        if (g_rotate_verify) {
+            for (const int ts : touched) {
+                const long bad = vram->verify_slot(ts);
+                CHECK(bad == 0, "U5FIX: layer %zu slot %d did not read back byte-identical after "
+                      "the reset's replay (%ld mismatched check(s): row bytes or their source "
+                      "pointer)", l, ts, bad);
+            }
+        }
+        // (2) THE POLICY.  rot_setup() re-derives the ghost window, the slot stamps (the set's own
+        // order) and admit_k; the queues and the per-layer counters are cleared here because
+        // rot_setup does not touch them.
+        ly.rot.pending.clear();
+        ly.rot.cand.clear();
+        ly.rot_setup(vram, ram);
+        ly.rot.pos = 0; ly.rot.admitted = 0; ly.rot.evicted = 0;
+        ly.rot.refreshes = 0; ly.rot.audits = 0; ly.rot.vbad = 0;
+        // (3) THE STANDING AUDIT, on the restored state — the same walk every refresh runs.
+        // The replay's row copies are ASYNC on this store's stream (U4FIX item 11): ordered for the
+        // next position, but a close() straight after a reset would free buffers with copies in
+        // flight, so the stream is drained here rather than reasoned about.
+        if (vram->backend) ggml_backend_synchronize(vram->backend);
+        audit_store_list(ly.stores, ly.ly->layer, false, &ly.ly->gu_lt, &ly.ly->dn_lt);
+    }
+}
+
+void M1Session::close() {
+    for (LoopLayer & ly : L) { for (Store * s : ly.stores) delete s; ly.stores.clear(); }
+    layer_own.clear();          // frees the layers' (possibly CUDA) buffers
+    // U4FIX item 10: the emb/head buffers are released HERE, i.e. BEFORE the backend they live on,
+    // so the free order is uniform (every buffer goes before the backend it was allocated from)
+    // instead of relying on the destructors that run after close() at `delete s`.
+    emb.release();
+    head.release();
+    if (gpu) { ggml_backend_free(gpu); gpu = nullptr; }
+    delete m; m = nullptr;
+    L.clear();
+    core_be = nullptr;
+    // U4FIX item 5: g_perm points into THIS session's perm_storage and is read on a deciding path
+    // (forward()'s `sel[i] = P[sel[i]]`).  Left dangling, a second session in the same process
+    // opened WITHOUT --route-perm would rewrite routed ids through a freed table — a use-after-free
+    // that changes which expert's weights are served.
+    g_perm = nullptr;
+}
+
+// ---- the C API (engine/m1_session.h) -------------------------------------------------------
+bool m1_session_open(const LoopArgs & a, M1Session ** out) {
+    CHECK(out, "m1_session_open: out == NULL");
+    *out = nullptr;
+    M1Session * s = new M1Session();
+    if (!s->open(a)) { m1_session_close(s); return false; }
+    *out = s;
+    return true;
+}
+bool m1_session_step(M1Session * s, int32_t tok, int pos, float * logits_row) {
+    return s && s->step(tok, pos, logits_row);
+}
+void m1_session_reset_rotation(M1Session * s) { if (s) s->reset_rotation(); }
+int  m1_session_kv_max(const M1Session * s)   { return s ? s->kv_max : 0; }
+int  m1_session_n_vocab(const M1Session * s)  { return s ? (int) s->head.n_vocab : 0; }
+void m1_session_close(M1Session * s) { if (!s) return; s->close(); delete s; }
+
+gguf_context * m1_session_gctx(const M1Session * s) { return s && s->m ? s->m->gctx : nullptr; }
+
+// U5 — THE PER-REQUEST ENTRY INVARIANT, made observable. It is the read side of
+// m1_session_reset_rotation(): every field the reset writes is checked here against what open()
+// left, so a server can assert "this request starts from the boot state" instead of trusting that
+// the previous request's reset ran. `why` names the first violation.
+bool m1_session_rotation_is_boot(const M1Session * s, std::string * why) {
+    auto fail = [why](const std::string & w) { if (why) *why = w; return false; };
+    if (!s) return fail("the session is null");
+    for (size_t l = 0; l < s->L.size(); ++l) {
+        const LoopLayer & ly = s->L[l];
+        if (!ly.rot.on) continue;                       // --rotate off: nothing to leak
+        if (l >= s->rot_initial.size())
+            return fail("layer " + std::to_string(l) + ": the boot membership was never recorded");
+        const Store * vram = ly.rot.vram;
+        if (!vram) return fail("layer " + std::to_string(l) + ": no VRAM store");
+        const std::vector<int> & boot = s->rot_initial[l];
+        if (vram->members != boot) {
+            size_t i = 0;
+            while (i < boot.size() && i < vram->members.size() && vram->members[i] == boot[i]) ++i;
+            return fail("layer " + std::to_string(l) + ": the VRAM membership differs from the "
+                        "boot set at slot " + std::to_string(i) + " (has " +
+                        (i < vram->members.size() ? std::to_string(vram->members[i]) : "n/a") +
+                        ", boot " + (i < boot.size() ? std::to_string(boot[i]) : "n/a") + ")");
+        }
+        if (ly.rot.pos != 0 || ly.rot.admitted != 0 || ly.rot.evicted != 0 ||
+            ly.rot.refreshes != 0 || ly.rot.audits != 0 || ly.rot.vbad != 0)
+            return fail("layer " + std::to_string(l) + ": rotation counters not zero (pos " +
+                        std::to_string(ly.rot.pos) + ", admitted " +
+                        std::to_string(ly.rot.admitted) + ", evicted " +
+                        std::to_string(ly.rot.evicted) + ", refreshes " +
+                        std::to_string(ly.rot.refreshes) + ", audits " +
+                        std::to_string(ly.rot.audits) + ", vbad " +
+                        std::to_string(ly.rot.vbad) + ")");
+        if (!ly.rot.pending.empty())
+            return fail("layer " + std::to_string(l) + ": " +
+                        std::to_string(ly.rot.pending.size()) + " refresh(es) pending");
+        if (!ly.rot.cand.empty())
+            return fail("layer " + std::to_string(l) + ": " +
+                        std::to_string(ly.rot.cand.size()) + " admission candidate(s) queued");
+        for (int e = 0; e < (int) N_EXPERT; ++e)
+            if (ly.rot.ghost[(size_t) e])
+                return fail("layer " + std::to_string(l) + ": ghost bit set for expert " +
+                            std::to_string(e));
+        for (int sl = 0; sl < (int) ly.rot.stamp.size(); ++sl)
+            if (ly.rot.stamp[(size_t) sl] != (long) sl - (long) ly.rot.stamp.size())
+                return fail("layer " + std::to_string(l) + ": slot " + std::to_string(sl) +
+                            " stamp is " + std::to_string(ly.rot.stamp[(size_t) sl]) +
+                            ", boot order is " +
+                            std::to_string((long) sl - (long) ly.rot.stamp.size()));
+    }
+    if (why) why->clear();
+    return true;
+}
+
+int loop_run(const LoopArgs & a) {
+    const bool scoring = !a.score_tokens.empty();   // M1/Q1: scoring mode (teacher forcing)
+    std::vector<int32_t> ids;
+    int n_prompt = 0;
+    if (!read_tokens((scoring ? a.score_tokens : a.tokens).c_str(), ids, n_prompt)) return 1;
+    if (scoring) {
+        // The scoring corpus is the WHOLE file, and its header's count must agree with the ids
+        // it carries: a corpus file whose header disagrees with its body is exactly the kind of
+        // silent drift the manifest exists to prevent.
+        if (n_prompt != (int) ids.size()) {
+            std::printf("FAIL: --score %s: header says n_prompt=%d but the file carries %zu ids; "
+                        "the scoring mode feeds the WHOLE file and needs them equal\n",
+                        a.score_tokens.c_str(), n_prompt, ids.size());
+            return 1;
+        }
+        if (ids.size() < 2) {
+            std::printf("FAIL: --score %s: %zu token(s) — needs >= 2 to score one position\n",
+                        a.score_tokens.c_str(), ids.size());
+            return 1;
+        }
+        // The reference dumps are indexed by the DECODE mapping (ref_pos0 = n_prompt-1); the
+        // score loop's rows are indexed from 0, so a --ref here would compare the wrong rows.
+        // Refuse rather than silently compare across two mappings.
+        if (!a.ref.empty() || !a.ref_tokens.empty()) {
+            std::printf("FAIL: --score with --ref/--ref-tokens: the score loop's row indices are "
+                        "NOT the decode mapping (ref_pos0 = n_prompt-1), so a reference "
+                        "comparison would be off by n_prompt-1 rows — run the two separately\n");
+            return 1;
+        }
+    }
+    if (!a.damage_tensor.empty()) {
+        m1_set_damage(a.damage_tensor.c_str(), a.damage_eps);
+        std::printf("# DAMAGE PROBE = '%s' x (1 + %.17g) at load — CALIBRATION ONLY; every number "
+                    "below is a damaged model, not a product number\n",
+                    a.damage_tensor.c_str(), a.damage_eps);
+    }
+    if (a.n_decode < 1 && !scoring) { std::printf("FAIL: --n-decode %d\n", a.n_decode); return 1; }
+    if (n_prompt < 1 && !scoring)   { std::printf("FAIL: %s has an empty prompt (n_prompt %d)\n", a.tokens.c_str(), n_prompt); return 1; }
+    const int n_total = scoring ? (int) ids.size() : n_prompt + a.n_decode;
+    const int kv_max  = a.kv_max > 0 ? a.kv_max : n_total;
+    if (kv_max < n_total) {
+        std::printf("FAIL: --kv-max %d < %d positions — the KV cache cannot hold the sequence\n", kv_max, n_total);
+        return 1;
+    }
+    const int ref_pos0 = n_prompt - 1;   // the -ub 1 chunk mapping, asserted below
+
+    // ---- U6: the routing trace + the treatment's id permutation -----------------------
+    // --route-perm: 36 lines "<l> <128 ints>"; entry e of line l = the PERMUTED FIXTURE id
+    // that carries original expert e's weights.  Applied to the store arm's read-back ids
+    // (post-taps, pre-enqueue) only; the router itself is untouched, so its own selection
+    // is bit-identical to the control's by construction.
+    // U4: the parsed table is STAGED here and ADOPTED by M1Session::open() (which then points
+    // g_perm at the session's own copy) — the parse must precede any model load, so it cannot run
+    // after the session exists.
+    if (!a.route_perm.empty()) {
+        CHECK(a.do_store, "--route-perm maps the STORE arm's read-back ids; it needs --arm-store");
+        CHECK(!a.falsify, "--route-perm is not wired into the falsifier path (and must not be)");
+        // FINDING-1 (H1's review): --route-perm maps routed ids to PERMUTED FIXTURE ids while
+        // --resident-set names ORIGINAL ids, so the set store's membership test would miss almost
+        // every routed expert and serve it from RAM — silently wrong bytes, exit 0.  Refuse.
+        CHECK(a.res_hot.empty(),
+              "--route-perm maps routed ids to PERMUTED FIXTURE ids and --resident-set names ORIGINAL ids: "
+              "combined they silently serve the wrong experts (exit 0) — refusing (U6's idiom was "
+              "fixture+perm; H1's is the set)");
+        FILE * f = std::fopen(a.route_perm.c_str(), "r");
+        CHECK(f, "cannot open --route-perm %s", a.route_perm.c_str());
+        g_perm_staging.assign((size_t) N_LAYERS * (size_t) N_EXPERT, -1);
+        char line[4096];
+        int rows = 0;
+        while (std::fgets(line, sizeof line, f)) {
+            if (line[0] == '#' || line[0] == '\n') continue;
+            int l;
+            char * p = line;
+            int got = std::sscanf(p, "%d", &l);
+            CHECK(got == 1 && l == rows && l >= 0 && l < (int) N_LAYERS,
+                  "route-perm row %d malformed (expected layer %d)", rows, rows);
+            p = std::strchr(line, ' ');
+            for (int e = 0; e < (int) N_EXPERT; ++e) {
+                CHECK(p != nullptr, "route-perm row %d: only %d entries", rows, e);
+                g_perm_staging[(size_t) l * N_EXPERT + e] = std::strtol(p, &p, 10);
+                p = std::strchr(p, ' ');
+            }
+            ++rows;
+        }
+        std::fclose(f);
+        CHECK(rows == (int) N_LAYERS, "route-perm has %d rows, expected %d", rows, (int) N_LAYERS);
+        for (int l = 0; l < (int) N_LAYERS; ++l) {
+            uint64_t seen[2] = { 0, 0 };   // 128-bit membership: ids run to 127, so a 32-bit
+            for (int e = 0; e < (int) N_EXPERT; ++e) {   // mask would collide (measured: 1u<<50 wraps to bit 18)
+                const int32_t v = g_perm_staging[(size_t) l * N_EXPERT + e];
+                CHECK(v >= 0 && v < (int) N_EXPERT, "route-perm row %d entry %d = %d out of range", l, e, v);
+                CHECK(!((seen[v >> 6] >> (v & 63)) & 1), "route-perm row %d: id %d appears twice", l, v);
+                seen[v >> 6] |= 1ull << (v & 63);
+            }
+            CHECK(seen[0] || seen[1], "route-perm row %d empty", l);   // (the dup+range checks above
+                                                                       // already force a full permutation)
+        }
+        g_perm = g_perm_staging.data();   // re-pointed at the session's copy in open()
+    }
+    if (!a.route_dump.empty()) {
+        CHECK(!a.falsify, "--route-dump is not wired into the falsifier path");
+        g_rdump = std::fopen(a.route_dump.c_str(), "w");
+        CHECK(g_rdump, "cannot open --route-dump %s", a.route_dump.c_str());
+        static char rdbuf[1 << 20];   // setvbuf holds the pointer for the whole run
+        std::setvbuf(g_rdump, rdbuf, _IOFBF, sizeof rdbuf);
+        std::fprintf(g_rdump, "# M1/U6 route trace: R <layer> <pos> <sel0..3 = the router's OWN ids, PRE-permutation> <w0..w3>\n");
+    }
+
+    // U7: the per-position split (timing only) + its empty-store probe.  Both are instrument
+    // flags, never the correctness path; the split cannot be combined with the falsifier (whose
+    // verdict is a paired timing statistic this instrumentation would perturb).
+    // U4FIX item 7: the four IN-LOOP instrumentation gates are assigned in M1Session::open() now
+    // (they are read by the layer build and by forward(), both of which the session owns), so a
+    // caller that fills these same LoopArgs fields gets the instrumentation instead of a silent
+    // no-op.  Their non-falsifier guards moved with them.
+    if (a.instr) {
+        CHECK(a.do_store, "--instr splits the STORE DRIVE; it needs --arm-store");
+        CHECK(!a.falsify, "--instr is not wired into the falsifier path (and must not be)");
+    }
+    if (a.extra_stores) {
+        CHECK(a.do_store, "--extra-stores needs --arm-store (it extends the store list)");
+        CHECK(!a.falsify, "--extra-stores is not wired into the falsifier path");
+        CHECK(a.extra_stores > 0 && a.extra_stores <= 64, "--extra-stores %d out of range", a.extra_stores);
+    }
+    // H3/U1: the core probe times the core GRAPH on the core backend; it needs the gpu-core
+    // configuration it is meant to explain, and it must not sit in the falsifier's timing path.
+    if (a.core_probe) {
+        CHECK(a.gpu_core, "--core-probe needs --gpu-core (the core graph runs on ROCm0)");
+        CHECK(!a.falsify, "--core-probe is not wired into the falsifier path");
+        CHECK(a.probe_reps > 0 && a.probe_reps <= 2000, "--probe-reps %d out of range", a.probe_reps);
+        CHECK(a.probe_gap_us >= 0 && a.probe_gap_us <= 100000, "--probe-gap-us %d out of range",
+              a.probe_gap_us);
+    }
+    // H3/U2: the fused attention expression is asserted only for the GPU-core arm, so the
+    // CPU-only correctness path (gate1's oracle) keeps the reference expansion BY CONSTRUCTION
+    // — the flag cannot reach it.
+    if (a.core_fuse >= 0) {
+        CHECK(a.core_fuse >= 0 && a.core_fuse <= 1, "--core-fuse %d out of range [0,1]", a.core_fuse);
+        CHECK(a.gpu_core, "--core-fuse is GPU-core only: the CPU-only arm must keep the reference "
+              "expansion (it is the numerics oracle)");
+        CHECK(!a.falsify, "--core-fuse is not wired into the falsifier path");
+    }
+    // H3/U4, H3/U5, H3/U11 — THE FOUR TRI-STATE CORE-OP HATCHES ARE RESOLVED IN M1Session::open(),
+    // not here (U4FIX item 1).  They are consumed by the LAYER BUILD, which happens inside the
+    // session, so a resolution that lives in this function leaves every other caller of
+    // m1_session_open() (the server, U5/U6) building the STOCK op sequence while the configuration
+    // block still prints "# gpu core = ON" — a silent-wrong measured at +0.199 % perplexity
+    // (results/q1.md:381-408).  ONE computation, in open(), two readers; the four "==1 needs
+    // --gpu-core" guards and the "--instr/--core-nodes/--resident-stats/--store-pull-at-drain are
+    // not wired into the falsifier" guards went with them, so a direct caller gets them too.
+    if (a.core_nodes) CHECK(a.instr, "--core-nodes needs --instr");
+
+    // U8: the fold is only meaningful when the core graph and the resident store share ONE
+    // backend (else the resident weights are not on the core backend and the mul_mat_id cannot
+    // reference them).  The falsifier times the STORE list's overlap — a configuration the fold
+    // deletes — so the two are never combined.
+    if (a.fold_resident) {
+        CHECK(a.do_store, "--fold-resident needs --arm-store (it replaces the VRAM store's slice)");
+        CHECK(a.gpu_core && a.gpu_store,
+              "--fold-resident needs --gpu-core AND --gpu-store: the fold runs the resident MoE "
+              "inside the core graph, so the core and the resident experts must share the ROCm0 backend");
+        CHECK(!a.falsify, "--fold-resident is not wired into the falsifier path (the falsifier times "
+              "the store list the fold deletes)");
+    }
+    // U9: the slot-count A/B is a fold-mode timing knob only.
+    if (a.fold_slots >= 0) {
+        CHECK(a.fold_resident, "--fold-slots overrides the fold's resident block; it needs --fold-resident");
+        CHECK(!a.falsify, "--fold-slots is a timing A/B; it is not wired into the falsifier path");
+        CHECK(a.fold_slots <= (int) N_USED, "--fold-slots %d out of range [0,%d]", a.fold_slots, (int) N_USED);
+    }
+    // H1 — the resident SET replaces the store list's INTERVAL membership, so it needs the store
+    // arm.  It is NOT wired into the retired resident fold: that fold deletes the VRAM
+    // store, and a set with no store to hold it would be a silent no-op — refuse instead.
+    if (!a.res_hot.empty()) {
+        CHECK(a.do_store, "--resident-set sets the STORE LIST's membership; it needs --arm-store");
+        CHECK(!a.fold_resident, "--resident-set is not wired into the retired resident fold — "
+                               "the fold has no VRAM store to hold the set");
+    }
+
+    // ---- THE SESSION (U4) ------------------------------------------------------------------
+    // Everything from the model load to the footprint print is M1Session::open()'s: the engine
+    // state is built ONCE here and driven one position at a time below (M1Session::step), so this
+    // binary and the server cannot diverge.  The boot prompt is published first, because the
+    // configuration block prints its three lines (same prints, same order, one place).
+    m1_session_boot_prompt(&ids, n_prompt, n_total, scoring);
+    M1Session * S = nullptr;
+    if (!m1_session_open(a, &S)) return 1;
 
     // ---- the falsifier (its own verdict section; the token loop is not run) -----------
     if (a.falsify) {
@@ -2703,13 +2942,13 @@ static int loop_run(const LoopArgs & a) {
         // the ratio and therefore DILUTES it toward 1.00 (the measured dilution, §results).
         auto one_pass = [&](bool serial, double * store_ms) {
             double acc = 0.0;
-            emb.run(core_be, ids[0], x.data());
+            S->emb.run(S->core_be, ids[0], x.data());
             for (int l = 0; l < a.f_layers; ++l) {
-                LoopLayer & ly = L[(size_t) l];
+                LoopLayer & ly = S->L[(size_t) l];
                 const int32_t pos = 0;
                 const int64_t kidx = 0, nkv = 1;
                 ly.ly->set_input(x.data(), &pos, &kidx, &nkv);
-                ggml_backend_graph_compute(ly.be_core ? ly.be_core : cpu, ly.ly->gf_core);
+                ggml_backend_graph_compute(ly.be_core ? ly.be_core : S->cpu, ly.ly->gf_core);
                 ly.ly->read(ly.ly->g_cur, ly.cur.data());
                 ly.ly->read(ly.ly->g_sel, ly.sel.data());
                 ly.ly->read(ly.ly->g_wts, ly.wts.data());
@@ -2722,8 +2961,8 @@ static int loop_run(const LoopArgs & a) {
                         ly.drain_one(s);
                     }
                 } else {
-                    ly.enqueue_all(cpu);
-                    ly.drain_all(cpu);
+                    ly.enqueue_all(S->cpu);
+                    ly.drain_all(S->cpu);
                 }
                 acc += now_s() - u0;
                 x = ly.y;   // the store block's output IS the compare point between the arms
@@ -2814,10 +3053,7 @@ static int loop_run(const LoopArgs & a) {
                         "the ratio is meaningless\n", arm_diff);
             rc = 1;
         }
-        for (LoopLayer & ly : L) { for (Store * s : ly.stores) delete s; ly.stores.clear(); }
-        layer_own.clear();          // U4c: free the (possibly CUDA) layer buffers BEFORE the backend
-        if (gpu) ggml_backend_free(gpu);
-        delete m;
+        m1_session_close(S);        // U4c order preserved: the layers' buffers go before the backend
         return rc;
     }
 
@@ -2829,7 +3065,7 @@ static int loop_run(const LoopArgs & a) {
     rows.reserve((size_t) a.n_decode);
     gen.reserve((size_t) a.n_decode);
 
-    std::vector<float> x((size_t) H_DIM, 0.0f), row((size_t) head.n_vocab, 0.0f);
+    std::vector<float> row((size_t) S->head.n_vocab, 0.0f);
     std::vector<TierAStats> t_out((size_t) N_LAYERS), t_inp((size_t) N_LAYERS), t_lout((size_t) N_LAYERS);
     TierAStats t_logits;
     int n_fail = 0;
@@ -2854,41 +3090,35 @@ static int loop_run(const LoopArgs & a) {
         // what makes a held-out text scorable in one O(N) pass.
         const int32_t tok = scoring ? ids[(size_t) p]
                                     : ((p < n_prompt) ? ids[p] : gen.back());
-        const double te0 = now_s();
-        emb.run(core_be, tok, x.data());
-        t_emb_acc += now_s() - te0;
-        for (int l = 0; l < (int) N_LAYERS; ++l) {
-            L[(size_t) l].forward(cpu, p, p + 1, x.data());
-            x = L[(size_t) l].l_out;
+        // THE POSITION — through the session (U4): embedding -> 36 layers -> head, one call.  The
+        // head runs exactly where the pre-carve code ran it: the score path's LAST position has no
+        // target, and the decode path's pre-ref_pos0 positions have no logits row, so `want_row`
+        // is false and step() skips the head (it is one body, not two copies of one).
+        const bool want_row = scoring ? (p + 1 < (int) ids.size()) : (p >= ref_pos0);
+        if (!m1_session_step(S, tok, p, want_row ? row.data() : nullptr)) {
+            m1_session_close(S);      // U4FIX item 9: no path leaves the session's buffers behind
+            return 1;
         }
         if (scoring) {
             // One row per position that HAS a target: position p's logits predict ids[p+1].  The
             // last position is computed (its KV row is written) and never dumped — it has no
             // successor to score.  <out>.tokens carries the TARGET ids, so a dump is
             // self-describing and the offline tool needs no second file.
-            if (p + 1 >= (int) ids.size()) {
+            if (!want_row) {
                 std::printf("p=%04d tok=%d (the last position: no target to score)\n", p, tok);
                 continue;
             }
-            const double th0 = now_s();
-            head.run(core_be, x.data(), row.data());
-            t_head_acc += now_s() - th0;
-            ++n_head_calls;
             rows.push_back(row);
             gen.push_back(ids[(size_t) p + 1]);
             std::printf("p=%04d tok=%d target=%d\n", p, tok, (int) ids[(size_t) p + 1]);
             continue;
         }
-        if (p < ref_pos0) continue;                       // no logits row at these positions
+        if (!want_row) continue;                          // no logits row at these positions
         const int step = p - ref_pos0;                    // == the reference's chunk index
         // The reference walks n_prompt + n_decode positions and keeps n_decode logits rows: the
         // row at position n_prompt-1+n_decode is COMPUTED by its last decode and never sampled,
         // so it is never dumped (moe_logits_dump.cpp's loop dumps at the top of the body).  The
         // walk here matches it row for row: the same head pass runs, the row is discarded.
-        const double th0 = now_s();
-        head.run(core_be, x.data(), row.data());
-        t_head_acc += now_s() - th0;
-        ++n_head_calls;
         const double tt0 = now_s();
         if (step >= a.n_decode) {
             std::printf("p=%03d tok=%d step=%03d (the last walked position: the reference computes "
@@ -2896,14 +3126,14 @@ static int loop_run(const LoopArgs & a) {
             t_tail_acc += now_s() - tt0;
             continue;
         }
-        const int32_t got = greedy_argmax(row.data(), head.n_vocab);
+        const int32_t got = greedy_argmax(row.data(), S->head.n_vocab);
         rows.push_back(row);
         gen.push_back(got);
 
-        const Sums s_log = sum_of(row.data(), head.n_vocab);
+        const Sums s_log = sum_of(row.data(), S->head.n_vocab);
         std::printf("p=%03d tok=%d step=%03d", p, tok, step);
-        if (have_rlog && step < (int) rlog.v.size()) {
-            const Sums & r = rlog.v[step];
+        if (S->have_rlog && step < (int) S->rlog.v.size()) {
+            const Sums & r = S->rlog.v[step];
             const double dsum = rel_delta(s_log.sum, r.sum), dsq = rel_delta(s_log.sumsq, r.sumsq);
             t_logits.add(dsq, step);
             std::printf(" | ref logits rel dsum=%.3e dsumsq=%.3e", dsum, dsq);
@@ -2918,16 +3148,16 @@ static int loop_run(const LoopArgs & a) {
 
         // the per-layer tier A table — the localisation instrument.  Compare BEFORE the tokens:
         // a layer that diverges identifies where a token divergence comes from.
-        if (have_ref && step < ref.n_dec_steps) {
+        if (S->have_ref && step < S->ref.n_dec_steps) {
             for (int l = 0; l < (int) N_LAYERS; ++l) {
-                const LoopLayer & ly = L[(size_t) l];
-                const RefChecksum & r_out = ref.v[step][(size_t) l * RefDump::N_KINDS + 2];
+                const LoopLayer & ly = S->L[(size_t) l];
+                const RefChecksum & r_out = S->ref.v[step][(size_t) l * RefDump::N_KINDS + 2];
                 if (!r_out.have) continue;
                 const Sums s_out = sum_of(ly.fout.data(), H_DIM);
                 const double d = rel_delta(s_out.sumsq, r_out.sumsq);
                 t_out[(size_t) l].add(d, step);
-                const RefChecksum & r_inp  = ref.v[step][(size_t) l * RefDump::N_KINDS + 3];
-                const RefChecksum & r_lout = ref.v[step][(size_t) l * RefDump::N_KINDS + 4];
+                const RefChecksum & r_inp  = S->ref.v[step][(size_t) l * RefDump::N_KINDS + 3];
+                const RefChecksum & r_lout = S->ref.v[step][(size_t) l * RefDump::N_KINDS + 4];
                 const Sums s_inp = sum_of(ly.ffn_inp.data(), H_DIM);
                 const Sums s_lout = sum_of(ly.l_out.data(), H_DIM);
                 const double d_inp  = r_inp.have  ? rel_delta(s_inp.sumsq,  r_inp.sumsq)  : 0.0;
@@ -2966,7 +3196,7 @@ static int loop_run(const LoopArgs & a) {
     // corrupted after the final refresh cannot leave the run with a clean exit.  Cheap (36 x ~176
     // integer compares) and outside every timing bracket.  FATALs on its own; no counter.
     if (a.rotate) {
-        for (const LoopLayer & ly : L)
+        for (const LoopLayer & ly : S->L)
             if (ly.rot.vram) ly.rot.vram->audit_index_table(ly.ly->layer);
         // U10 — THE FULL WALK MOVES HERE.  The per-refresh check is now scoped to what a refresh
         // writes (audit_refresh_swap); this is the O(36 x 128) walk it was before, run ONCE on the
@@ -2975,7 +3205,7 @@ static int loop_run(const LoopArgs & a) {
         // was: exactly-one-home over the running list, both stores' slice geometry, the alias's
         // 128-entry local_of table and every member's slot identity.  Outside every timing bracket.
         long n_full = 0;
-        for (const LoopLayer & ly : L) {
+        for (const LoopLayer & ly : S->L) {
             if (!ly.rot.vram) continue;
             audit_store_list(ly.stores, ly.ly->layer, false, &ly.ly->gu_lt, &ly.ly->dn_lt);
             ++n_full;
@@ -2990,13 +3220,13 @@ static int loop_run(const LoopArgs & a) {
     // sees it.  Runs once, outside every timing bracket, and fails the run if anything is off.
     if (a.rotate && a.rotate_verify) {
         long bad = 0, slots = 0;
-        for (LoopLayer & ly : L) {
+        for (LoopLayer & ly : S->L) {
             if (!ly.rot.vram) continue;
             bad += ly.rot.vram->verify_slot_bytes();
             slots += ly.rot.vram->n_e;
         }
         long vbad = 0, vn = 0;
-        for (const LoopLayer & ly : L) { vbad += ly.rot.vbad; vn += ly.rot.admitted; }
+        for (const LoopLayer & ly : S->L) { vbad += ly.rot.vbad; vn += ly.rot.admitted; }
         std::printf("# rotate verify = %ld resident slot(s) read back and memcmp'd to the file row of "
                     "the expert they claim: %ld mismatch(es); PLUS %ld per-swap read-back(s), %ld "
                     "mismatch(es)\n", slots, bad, vn, vbad);
@@ -3016,13 +3246,19 @@ static int loop_run(const LoopArgs & a) {
     print_loadavg("after the loop");
 
     // ---- the write-out: the reference's own logits format ----------------------------
-    if (!a.out.empty() && !write_logits(a.out.c_str(), rows, gen)) return 1;
+    if (!a.out.empty() && !write_logits(a.out.c_str(), rows, gen)) {
+        m1_session_close(S);          // U4FIX item 9
+        return 1;
+    }
 
     // ---- the token line --------------------------------------------------------------
     int n_tok_cmp = 0, n_tok_bad = 0, tok_first_div = -1;
     std::vector<int32_t> ref_tok;
     if (!a.ref_tokens.empty()) {
-        if (!read_tokens_bin(a.ref_tokens.c_str(), ref_tok)) return 1;
+        if (!read_tokens_bin(a.ref_tokens.c_str(), ref_tok)) {
+            m1_session_close(S);      // U4FIX item 9
+            return 1;
+        }
         n_tok_cmp = (int) std::min(ref_tok.size(), gen.size());
         for (int i = 0; i < n_tok_cmp; ++i)
             if (ref_tok[i] != gen[i]) { ++n_tok_bad; if (tok_first_div < 0) tok_first_div = i; }
@@ -3042,7 +3278,7 @@ static int loop_run(const LoopArgs & a) {
     if (g_res_stats) {
         long rn = 0, sn = 0;
         double lmin = 1.0, lmax = 0.0;
-        for (const LoopLayer & ly : L) {
+        for (const LoopLayer & ly : S->L) {
             if (!ly.routed_n) continue;
             rn += ly.routed_n; sn += ly.served_n;
             const double c = (double) ly.served_n / (double) ly.routed_n;
@@ -3056,12 +3292,12 @@ static int loop_run(const LoopArgs & a) {
         // i.e. it is the membership that actually served each position (not the bootstrapped set).
         if (a.rotate) {
             long adm = 0, evi = 0, rfr = 0, aud = 0;
-            for (const LoopLayer & ly : L) {
+            for (const LoopLayer & ly : S->L) {
                 adm += ly.rot.admitted; evi += ly.rot.evicted;
                 rfr += ly.rot.refreshes; aud += ly.rot.audits;
             }
             double exp_mib = 0.0;
-            for (const LoopLayer & ly : L)
+            for (const LoopLayer & ly : S->L)
                 if (ly.rot.vram) {
                     exp_mib = (double) (ly.rot.vram->slices[0].gu_stride +
                                         ly.rot.vram->slices[0].d_stride) / (1024.0*1024.0);
@@ -3186,11 +3422,12 @@ static int loop_run(const LoopArgs & a) {
     // printed above, so the probe cannot perturb one.
     if (a.core_probe && a.gpu_core) {
         const int ppos = (int) std::min<int64_t>(n_total, kv_max - 4);
-        core_probe_run(*m, gpu, kv_max, a.n_res, x, ppos, a.probe_reps, a.probe_gap_us, m4_on, kqkv_on,
-                       kvw_on, wvb_on);
+        // the RESOLVED hatches open() published — the same ones the layers were built with
+        core_probe_run(*S->m, S->gpu, kv_max, a.n_res, S->x, ppos, a.probe_reps, a.probe_gap_us,
+                       g_m4_on, g_kqkv_on, g_kvwrite_on, g_wvb_on);
         // H3/U3: the attention-chain bisection (the per-kernel-group split).
-        attn_bisection_run(*m, gpu, kv_max, a.n_res, x, ppos, a.probe_reps, a.probe_gap_us, m4_on, kqkv_on,
-                           kvw_on, wvb_on);
+        attn_bisection_run(*S->m, S->gpu, kv_max, a.n_res, S->x, ppos, a.probe_reps, a.probe_gap_us,
+                           g_m4_on, g_kqkv_on, g_kvwrite_on, g_wvb_on);
     }
     std::printf("#   (U4 owns tok/s; this number exists only to say what the correctness line cost)\n");
 
@@ -3222,7 +3459,7 @@ static int loop_run(const LoopArgs & a) {
         std::printf("TOKEN LINE: not evaluated (no --ref-tokens)\n");
     }
 
-    if (have_ref) {
+    if (S->have_ref) {
         std::printf("TIER A (per-layer fingerprints vs the reference's own sums; rel delta of sumsq):\n");
         std::printf("  layer  steps  worst ffn_out     at  worst ffn_inp     worst l_out      cells>%.0e (out/inp/lout)\n", REL_PRINT_FLOOR);
         for (int l = 0; l < (int) N_LAYERS; ++l) {
@@ -3253,232 +3490,6 @@ static int loop_run(const LoopArgs & a) {
     }
 
     std::printf("VERDICT: %s (%d FAIL lines)\n", n_fail ? "FAIL" : "PASS", n_fail);
-    for (LoopLayer & ly : L) { for (Store * s : ly.stores) delete s; }
-    layer_own.clear();          // frees the layers (unique_ptr)
-    if (gpu) ggml_backend_free(gpu);
-    delete m;
+    m1_session_close(S);        // frees the stores, the layers (unique_ptr), the backend, the model
     return n_fail ? 1 : 0;
-}
-
-// ---------------------------------------------------------------------------
-int main(int argc, char ** argv) {
-    LayerCheckArgs lc;
-    LoopArgs       lp;
-    std::string model = DEFAULT_MODEL;
-    bool quiet = false, do_layer_check = false, do_loop = false, n_res_given = false;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto need = [&](const char * opt) -> std::string {
-            if (i + 1 >= argc) FATAL("%s needs a value", opt);
-            return argv[++i];
-        };
-        if (a == "--model")            { model = need("--model"); lc.model = model; lp.model = model; }
-        else if (a == "--quiet")       quiet = true;
-        else if (a == "--layer-check") do_layer_check = true;
-        else if (a == "--loop")        do_loop = true;
-        else if (a == "--tokens")      { lc.tokens = need("--tokens"); lp.tokens = lc.tokens; }
-        else if (a == "--ref")         { lc.ref = need("--ref"); lp.ref = lc.ref; }
-        else if (a == "--dump")        { lc.dump = need("--dump"); lp.dump = lc.dump; }
-        else if (a == "--route-dump")  lp.route_dump = need("--route-dump");
-        else if (a == "--route-perm")  lp.route_perm = need("--route-perm");
-        else if (a == "--resident-set") { lp.res_path = need("--resident-set");
-                                          lc.res_path = lp.res_path; }
-        else if (a == "--ref-pos0")    lc.ref_pos0 = std::atoi(need("--ref-pos0").c_str());
-        else if (a == "--kv-max")      { lc.kv_max = std::atoi(need("--kv-max").c_str());
-                                         lp.kv_max = lc.kv_max; }
-        else if (a == "--router-margin") lc.router_margin = true;
-        else if (a == "--layers")      lc.layers = std::atoi(need("--layers").c_str());
-        else if (a == "--n-res")       { lc.n_res = std::atoi(need("--n-res").c_str());
-                                         lp.n_res = lc.n_res; n_res_given = true; }
-        else if (a == "--threads")     { lc.threads = std::atoi(need("--threads").c_str());
-                                         lp.threads = lc.threads; }
-        else if (a == "--arm-oracle")  { lc.do_oracle = true;  lc.do_store = false; lp.do_store = false; }
-        else if (a == "--arm-store")   { lc.do_oracle = false; lc.do_store = true;  lp.do_store = true; }
-        else if (a == "--arms-both")   { lc.do_oracle = true;  lc.do_store = true; }
-        // ---- U3: the loop + the falsifier ------------------------------------------
-        else if (a == "--out")         lp.out = need("--out");
-        else if (a == "--ref-tokens")  lp.ref_tokens = need("--ref-tokens");
-        else if (a == "--n-decode")    lp.n_decode = std::atoi(need("--n-decode").c_str());
-        else if (a == "--falsify")     lp.falsify = true;
-        else if (a == "--falsify-layers") lp.f_layers = std::atoi(need("--falsify-layers").c_str());
-        else if (a == "--iters")       lp.iters = std::atoi(need("--iters").c_str());
-        else if (a == "--warmup")      lp.warmup = std::atoi(need("--warmup").c_str());
-        else if (a == "--serialize-both") lp.serialize_both = true;
-        else if (a == "--gpu-store")   lp.gpu_store = true;
-        else if (a == "--gpu-core")    lp.gpu_core = true;
-        else if (a == "--thresh")      lp.thresh = std::atof(need("--thresh").c_str());
-        else if (a == "--instr")       lp.instr = true;
-        else if (a == "--resident-stats") lp.res_stats = true;
-        else if (a == "--extra-stores") lp.extra_stores = std::atoi(need("--extra-stores").c_str());
-        else if (a == "--store-pull-at-drain") lp.store_pull_at_drain = true;
-        else if (a == "--store-footprint") lp.footprint = true;   // H2/U1: accounting print only
-        else if (a == "--alias-prefault") lp.alias_prefault = true;  // U2b: hoist the fault cost
-        // U9: the EXPLICIT opposite arm.  Without it an A/B names only the ON side and relies on a
-        // flag's ABSENCE for the control — the ON-vs-ON error L60 recorded.  The default is
-        // unchanged (OFF): U9 measured that hoisting wins the loop but costs 1.20 s of startup,
-        // which is a net loss at the product configuration's 155 positions (see results/m1-h3-u9.md).
-        else if (a == "--no-alias-prefault") lp.alias_prefault = false;
-        else if (a == "--rotate")          lp.rotate = true;         // U2b: 2Q rotation
-        else if (a == "--rotate-verify")   lp.rotate_verify = true;  // U2b: post-loop byte check
-        // U10: the refresh audit's scope (default = the swap's own experts) and the 2Q window's
-        // threshold (default 2 = the shipped policy).
-        else if (a == "--audit-full")      { lp.audit_full = true;  lp.audit_scope_set = true; }
-        else if (a == "--audit-incremental") { lp.audit_full = false; lp.audit_scope_set = true; }
-        else if (a == "--rot-admit-k")   { lp.rot_admit_k = std::atoi(need("--rot-admit-k").c_str());
-                                           lp.rot_admit_k_set = true; }
-        else if (a == "--fold-resident") lp.fold_resident = true;
-        else if (a == "--fold-slots")   lp.fold_slots = std::atoi(need("--fold-slots").c_str());
-        else if (a == "--core-probe")   lp.core_probe = true;   // H3/U1: the post-loop core probe
-        else if (a == "--probe-reps")   lp.probe_reps = std::atoi(need("--probe-reps").c_str());
-        else if (a == "--probe-gap-us") lp.probe_gap_us = std::atoi(need("--probe-gap-us").c_str());
-        else if (a == "--core-fuse")    lp.core_fuse = std::atoi(need("--core-fuse").c_str());
-        else if (a == "--core-nodes")   lp.core_nodes = true;
-        else if (a == "--m4-wkb")       lp.m4_wkb = 1;      // H3/U4: the wk_b custom-op hatch (explicit)
-        else if (a == "--no-m4-wkb")    lp.m4_wkb = 0;      // the stock MMVQ path (pre-H3-U4 bytes)
-        else if (a == "--m4-kqkv")      lp.m4_kqkv = 1;     // H3/U5: the fused attention-core hatch (explicit)
-        else if (a == "--no-m4-kqkv")   lp.m4_kqkv = 0;     // the reference kq/softmax/kqv sequence
-        else if (a == "--m4-kvwrite")   lp.m4_kvwrite = 1;  // H3/U11: the fused KV-write phase (explicit)
-        else if (a == "--no-m4-kvwrite") lp.m4_kvwrite = 0; // the reference wkv_a/norm/rope/scatter
-        else if (a == "--m4-wvb")       lp.m4_wvb = 1;      // H3/U11: the fused wv_b gemv (explicit)
-        else if (a == "--no-m4-wvb")    lp.m4_wvb = 0;      // the reference wv_b mul_mat
-        // ---- M1/Q1 — the quality instrument's engine side (both additive, default OFF) ----
-        else if (a == "--score")       { lp.score_tokens = need("--score"); do_loop = true; }
-        else if (a == "--damage")      { lp.damage_tensor = need("--damage");
-                                         const std::string ev = need("--damage");
-                                         char * end = nullptr;
-                                         lp.damage_eps = std::strtod(ev.c_str(), &end);
-                                         // a typo'd eps that parses to 0 would make the damage
-                                         // probe a SILENT no-op — refuse instead
-                                         if (end == ev.c_str() || *end != '\0')
-                                             FATAL("--damage %s: '%s' is not a number",
-                                                   lp.damage_tensor.c_str(), ev.c_str()); }
-        else FATAL("unknown arg '%s'", a.c_str());
-    }
-
-    // H1 — load the resident set ONCE, for both paths, and refuse a CONFLICTING --n-res rather
-    // than silently preferring one of them: the set's size IS the resident count, and a caller who
-    // passes both must have them agree.
-    if (!lp.res_path.empty()) {
-        int rn = 0;
-        if (!read_hotset_json(lp.res_path.c_str(), lp.res_hot, rn)) return 2;
-        lp.res_n = rn;
-        if (n_res_given && lp.n_res != rn)
-            FATAL("--n-res %d conflicts with --resident-set %s (n_res=%d): the SET is the resident "
-                  "count — drop --n-res or pass the matching value", lp.n_res, lp.res_path.c_str(), rn);
-        lp.n_res = rn;
-        lc.n_res = rn;
-        lc.res_hot = lp.res_hot;
-    }
-
-    if (do_layer_check) {
-        if (lc.tokens.empty()) FATAL("--layer-check needs --tokens <file>");
-        return layer_check(lc);
-    }
-    if (do_loop) {
-        if (lp.tokens.empty() && lp.score_tokens.empty())
-            FATAL("--loop needs --tokens <file> (or --score <file> for the scoring mode)");
-        if (lp.falsify) {
-            if (!lp.score_tokens.empty()) FATAL("--score and --falsify are different runs");
-            if (!lp.do_store) FATAL("--falsify needs --arm-store (the paired statistic times the "
-                                    "PRODUCT store list, not the monolithic op sequence)");
-            if (lp.f_layers < 1 || lp.f_layers > (int) N_LAYERS) FATAL("--falsify-layers %d", lp.f_layers);
-            if (lp.iters < 1) FATAL("--iters %d would measure nothing", lp.iters);
-            if (lp.warmup < 0) FATAL("--warmup %d", lp.warmup);
-        } else {
-            if (lp.out.empty()) FATAL("--loop needs --out <logits file>");
-        }
-        return loop_run(lp);
-    }
-
-    GGUFModel * m = GGUFModel::load(model.c_str());
-    const ModelSurface ms = m->read_surface();
-    const SurfaceCheck ck = check_surface(*m, ms);
-
-    const int n_expect = (int) N_LAYERS * N_LAYER_TENSOR + N_GLOBAL_TENSOR;
-
-    std::printf("# M1 skeleton (U1) — loader only: no layer forward, no attention, no KV, no sampler.\n");
-    std::printf("# model=%s  bytes=%zu  tensors_in_file=%lld\n",
-                m->path.c_str(), m->file_size, (long long) ms.n_tensors_file);
-    std::printf("# constants: H=%lld FF=%lld N_EXPERT=%lld N_USED=%lld N_LAYERS=%lld\n",
-                (long long) H_DIM, (long long) FF_DIM, (long long) N_EXPERT,
-                (long long) N_USED, (long long) N_LAYERS);
-    std::printf("# surface: %lld layers x %d tensors + %d globals = %d rows (checklist)\n\n",
-                (long long) N_LAYERS, N_LAYER_TENSOR, N_GLOBAL_TENSOR, n_expect);
-
-    if (!quiet) {
-        std::printf("# per-layer type table AS READ (one line per layer):\n");
-        for (int l = 0; l < (int) N_LAYERS; ++l) {
-            std::printf("%2d ", l);
-            for (int i = 0; i < N_LAYER_TENSOR; ++i) {
-                const TensorInfo & ti = ms.layer[l].t[i];
-                std::printf(" %s=%s%s", LAYER_TENSOR_SPECS[i].suffix,
-                            ti.present ? ggml_type_name(ti.type) : "ABSENT",
-                            tensor_shape_str(ti).c_str());
-            }
-            std::printf("\n");
-        }
-        std::printf("\n# globals AS READ:\n");
-        for (int i = 0; i < N_GLOBAL_TENSOR; ++i) {
-            const TensorInfo & ti = ms.global[i];
-            std::printf("#   %-18s %s%s  %zu B\n", GLOBAL_TENSOR_SPECS[i].suffix,
-                        ti.present ? ggml_type_name(ti.type) : "ABSENT",
-                        tensor_shape_str(ti).c_str(), ti.nbytes);
-        }
-        std::printf("\n");
-    }
-
-    std::printf("# per-(tensor,type) counts over the %lld layers (type -> layers):\n", (long long) N_LAYERS);
-    for (int i = 0; i < N_LAYER_TENSOR; ++i) {
-        std::map<std::string, int> counts;
-        for (int l = 0; l < (int) N_LAYERS; ++l) {
-            const TensorInfo & ti = ms.layer[l].t[i];
-            ++counts[ti.present ? ggml_type_name(ti.type) : "ABSENT"];
-        }
-        std::string s;
-        for (const auto & kv : counts) {
-            if (!s.empty()) s += ", ";
-            s += kv.first + " x" + std::to_string(kv.second);
-        }
-        std::printf("#   %-22s %s\n", LAYER_TENSOR_SPECS[i].suffix, s.c_str());
-    }
-    std::printf("\n");
-
-    // ---- the check ---------------------------------------------------------------
-    std::printf("=== TYPE TABLE CHECK (U1) ===\n");
-    std::printf("rows compared        = %d (expected %d)\n", ck.n_rows, n_expect);
-    // SEAM 3: the count above is FILE TENSORS accounted for.  A grouped file has no flat
-    // logical tensor for a grouped row — its members ARE the file tensors — so say which
-    // count this is, or a grouped file reads as a broken one.
-    if (ms.n_group_members > 0)
-        std::printf("tensors classified   = %d of %lld in the file (%d are group members standing\n"
-                    "                       in for %d grouped logical rows: the file holds no flat\n"
-                    "                       tensor for those rows, so rows+members > file tensors)\n",
-                    ms.n_classified, (long long) ms.n_tensors_file,
-                    ms.n_group_members, ck.n_group_rows);
-    else
-        std::printf("tensors classified   = %d of %lld in the file\n",
-                    ms.n_classified, (long long) ms.n_tensors_file);
-    std::printf("missing              = %d\n", ck.n_missing);
-    std::printf("type mismatch        = %d\n", ck.n_type_bad);
-    std::printf("shape mismatch       = %d\n", ck.n_shape_bad);
-    std::printf("unclassified tensors = %d\n", ck.n_unclassified);
-    std::printf("duplicate rows       = %d\n", ck.n_duplicate);
-    if (!ck.fails.empty()) {
-        std::printf("--- FAIL lines (up to 64) ---\n");
-        for (const std::string & f : ck.fails) std::printf("FAIL: %s\n", f.c_str());
-    }
-    const bool file_ok = (ms.n_classified == ms.n_tensors_file && ck.n_unclassified == 0);
-    const bool ok = ck.ok() && file_ok;
-    std::printf("CHECK: %s — %d checklist rows (%lld x %d + %d)%s; %d/%lld FILE TENSORS classified%s\n",
-                ok ? "PASS" : "FAIL", n_expect, (long long) N_LAYERS, N_LAYER_TENSOR, N_GLOBAL_TENSOR,
-                ck.ok() ? " all match" : " MISMATCH (see FAIL lines)",
-                ms.n_classified, (long long) ms.n_tensors_file,
-                ms.n_group_members > 0
-                    ? " [grouped surface: members counted, their logical rows carry no file tensor]"
-                    : " [ungrouped file: one file tensor per checklist row]");
-    std::printf("# NOTE: this is a LOADER check only.  Use --layer-check for the U2 layer forward.\n");
-
-    delete m;
-    return ok ? 0 : 1;
 }

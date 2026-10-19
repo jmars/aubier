@@ -22,6 +22,7 @@ GGML_LIB="$BUILDS/hip/bin"
 for f in "$GGML_LIB/libggml-base.so" "$GGML_LIB/libggml-cpu.so" "$GGML_LIB/libggml-hip.so" \
          "$ROCMLIB/libamdhip64.so.7" "$GGML_INC/ggml.h" "$GGML_INC/gguf.h" \
          "$ROOT/engine/m1_engine.cpp" "$ROOT/engine/m1_layer.cpp" \
+         "$ROOT/engine/m1_main.cpp" "$ROOT/engine/m1_session.h" \
          "$ROOT/engine/gguf_model.h" "$ROOT/engine/store.h" "$ROOT/engine/m1_layer.h"; do
     [ -e "$f" ] || { echo "engine_build_m1.sh: FATAL: missing $f" >&2; exit 1; }
 done
@@ -30,7 +31,7 @@ mkdir -p "$BUILDS/engine"
 
 /usr/bin/c++ -O2 -std=c++17 \
     -I "$GGML_INC" \
-    "$ROOT/engine/m1_engine.cpp" "$ROOT/engine/m1_layer.cpp" \
+    "$ROOT/engine/m1_engine.cpp" "$ROOT/engine/m1_layer.cpp" "$ROOT/engine/m1_main.cpp" \
     -L "$GGML_LIB" -lggml-hip -lggml-cpu -lggml -lggml-base \
     -Wl,-rpath,"$GGML_LIB" -Wl,-rpath,"$ROCMLIB" \
     -Wl,--disable-new-dtags \
