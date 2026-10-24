@@ -70,7 +70,11 @@ struct EmbGraph {
         gf = nullptr;
     }
 
-    void build(GGUFModel & m, ggml_backend_t backend) {
+    // B2: the nt=1 instance (layer_check's own graph; identical to build(m, backend, 1)).
+    void build(GGUFModel & m, ggml_backend_t backend) { build(m, backend, 1); }
+    // B2: build the same graph `nt` wide (a batched session embeds N tokens per step).  nt=1
+    // builds exactly the [1] graph this struct always built and the bytes cannot move.
+    void build(GGUFModel & m, ggml_backend_t backend, int nt) {
         ggml_init_params ip = { 16u << 20, nullptr, true };
         ctx = ggml_init(ip);
         CHECK(ctx, "ggml_init failed for the embedding graph");
@@ -84,19 +88,24 @@ struct EmbGraph {
         CHECK(lt.segs[0].type == GGML_TYPE_Q4_K, "token_embd is %s, expected q4_K",
               ggml_type_name(lt.segs[0].type));
         w   = ggml_new_tensor_2d(ctx, lt.segs[0].type, lt.ne[0], lt.ne[1]);
-        tin = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        tin = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nt);
         ggml_set_input(tin);
-        out = ggml_get_rows(ctx, w, tin);   // F32 [H, 1]
+        out = ggml_get_rows(ctx, w, tin);   // F32 [H, nt]
         buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
         CHECK(buf, "alloc failed for the embedding graph");
         ggml_backend_tensor_set(w, lt.segs[0].bytes, 0, lt.segs[0].nbytes);
         gf = ggml_new_graph_custom(ctx, 64, false);
         ggml_build_forward_expand(gf, out);
     }
-    void run(ggml_backend_t backend, int32_t tok, float * x) {
-        ggml_backend_tensor_set(tin, &tok, 0, sizeof(tok));
+    // B2: the nt-row run — x receives [H, nt] (row t = the embedding of toks[t]).  run() below is
+    // the nt=1 instance and keeps its exact old bytes.
+    void run_n(ggml_backend_t backend, const int32_t * toks, int nt, float * x) {
+        ggml_backend_tensor_set(tin, toks, 0, sizeof(int32_t) * (size_t) nt);
         ggml_backend_graph_compute(backend, gf);
-        ggml_backend_tensor_get(out, x, 0, sizeof(float) * (size_t) H_DIM);
+        ggml_backend_tensor_get(out, x, 0, sizeof(float) * (size_t) H_DIM * (size_t) nt);
+    }
+    void run(ggml_backend_t backend, int32_t tok, float * x) {
+        run_n(backend, &tok, 1, x);
     }
 };
 
@@ -130,7 +139,10 @@ struct HeadGraph {
         gf = nullptr;
     }
 
-    void build(GGUFModel & m, ggml_backend_t backend) {
+    void build(GGUFModel & m, ggml_backend_t backend) { build(m, backend, 1); }
+    // B2 (plan §E): the head becomes [vocab, nt] — the SAME two ops, N columns.  At nt=1 the
+    // graph is exactly the one this struct always built, so the single-token bytes cannot move.
+    void build(GGUFModel & m, ggml_backend_t backend, int nt) {
         ggml_init_params ip = { 16u << 20, nullptr, true };
         ctx = ggml_init(ip);
         CHECK(ctx, "ggml_init failed for the output head graph");
@@ -151,7 +163,7 @@ struct HeadGraph {
         ggml_set_name(w_norm, "output_norm.weight");
         ggml_set_name(w_out,  "output.weight");
 
-        g_h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H_DIM, 1);
+        g_h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H_DIM, nt);
         ggml_set_input(g_h);
         ggml_set_name(g_h, "m1_head_in");
         g_norm = ggml_mul(ctx, ggml_rms_norm(ctx, g_h, L_RMS_EPS), w_norm);
@@ -176,10 +188,16 @@ struct HeadGraph {
         gf = ggml_new_graph_custom(ctx, 16, false);
         ggml_build_forward_expand(gf, g_logits);
     }
-    void run(ggml_backend_t backend, const float * h, float * logits) const {
-        ggml_backend_tensor_set(g_h, h, 0, sizeof(float) * (size_t) H_DIM);
+    // B2: the nt-row run — h is [H, nt], logits receives nt consecutive n_vocab rows (row t for
+    // token t).  run() below is the nt=1 instance and keeps its exact old bytes.
+    void run_n(ggml_backend_t backend, const float * h, float * logits, int nt) const {
+        ggml_backend_tensor_set(g_h, h, 0, sizeof(float) * (size_t) H_DIM * (size_t) nt);
         ggml_backend_graph_compute(backend, gf);
-        ggml_backend_tensor_get(g_logits, logits, 0, sizeof(float) * (size_t) n_vocab);
+        ggml_backend_tensor_get(g_logits, logits, 0,
+                                sizeof(float) * (size_t) n_vocab * (size_t) nt);
+    }
+    void run(ggml_backend_t backend, const float * h, float * logits) const {
+        run_n(backend, h, logits, 1);
     }
 };
 
@@ -776,8 +794,9 @@ int layer_check(const LayerCheckArgs & a) {
             M1Layer & ly = *L[l];
             const int32_t pos32 = p;
             const int64_t kidx  = p;
+            const int64_t base  = 0;      // B1 seam: one window from cell 0 (no per-sequence regions)
             const int64_t nkv   = p + 1;
-            ly.set_input(x.data(), &pos32, &kidx, &nkv);
+            ly.set_input(x.data(), &pos32, &kidx, &base, &nkv);
 
             if (a.do_oracle) {
                 ggml_backend_graph_compute(cpu, ly.gf_oracle);
@@ -1105,6 +1124,11 @@ struct LoopLayer {
     M1Layer * ly = nullptr;
     ggml_backend_t be_core = nullptr;          // U4c: non-null => the core graph runs here (ROCm0)
     std::vector<Store *> stores;               // empty => ARM_MOE_ORACLE (the transcription)
+    // B2: the token-batch width this layer's host buffers are sized for (the session's build
+    // width; 1 = today's single-token engine exactly).  kidx_buf carries the per-row KV write
+    // cell forward() derives from (kv_base[t] + pos[t]).
+    int nt = 1;
+    std::vector<int64_t> kidx_buf;
     std::vector<float> cur, ffn_inp, shexp, moe, moe_res, fout, y, l_out;
     std::vector<int32_t> sel;
     std::vector<float>   wts;
@@ -1136,13 +1160,15 @@ struct LoopLayer {
         long pos = 0, admitted = 0, evicted = 0, refreshes = 0, audits = 0, vbad = 0;
     } rot;
 
-    void init(M1Layer * l) {
-        ly = l;
-        cur.assign(H_DIM, 0.0f);     ffn_inp.assign(H_DIM, 0.0f); shexp.assign(H_DIM, 0.0f);
-        moe.assign(H_DIM, 0.0f);     moe_res.assign(H_DIM, 0.0f); fout.assign(H_DIM, 0.0f);
-        y.assign(H_DIM, 0.0f);
-        l_out.assign(H_DIM, 0.0f);
-        sel.assign(N_USED, 0);       wts.assign(N_USED, 0.0f);
+    void init(M1Layer * l, int nt_ = 1) {
+        ly = l; nt = nt_;
+        kidx_buf.assign((size_t) nt_, 0);
+        cur.assign((size_t) H_DIM * nt, 0.0f);  ffn_inp.assign((size_t) H_DIM * nt, 0.0f);
+        shexp.assign((size_t) H_DIM * nt, 0.0f); moe.assign((size_t) H_DIM * nt, 0.0f);
+        moe_res.assign((size_t) H_DIM * nt, 0.0f); fout.assign((size_t) H_DIM * nt, 0.0f);
+        y.assign((size_t) H_DIM * nt, 0.0f);
+        l_out.assign((size_t) H_DIM * nt, 0.0f);
+        sel.assign((size_t) N_USED * nt, 0);     wts.assign((size_t) N_USED * nt, 0.0f);
     }
     bool store_arm() const { return !stores.empty(); }
 
@@ -1249,11 +1275,11 @@ struct LoopLayer {
 
     void enqueue_all(ggml_backend_t cpu) {
         for (Store * s : stores) {
-            if (!g_instr) { s->fill(sel.data(), 1); s->enqueue(sel.data(), wts.data(), cur.data(), 1); continue; }
+            if (!g_instr) { s->fill(sel.data(), nt); s->enqueue(sel.data(), wts.data(), cur.data(), nt); continue; }
             const double t0 = now_s();
-            s->fill(sel.data(), 1);
+            s->fill(sel.data(), nt);
             const double t1 = now_s();
-            s->enqueue(sel.data(), wts.data(), cur.data(), 1);
+            s->enqueue(sel.data(), wts.data(), cur.data(), nt);
             const double t2 = now_s();
             t_fill_acc += t1 - t0;
             // the RAM (CPU) store's enqueue BLOCKS: it is the MoE compute and the weight bytes.
@@ -1304,23 +1330,32 @@ struct LoopLayer {
             else               t_sync_vram_acc += t1 - t0;
         }
         for (Store * s : stores) {
-            if (!g_instr) { s->drain(y.data(), 1, false, nullptr, nullptr, /*sync_backend*/ false); continue; }
+            if (!g_instr) { s->drain(y.data(), nt, false, nullptr, nullptr, /*sync_backend*/ false); continue; }
             const double t0 = now_s();
-            s->drain(y.data(), 1, false, nullptr, nullptr, /*sync_backend*/ false);
+            s->drain(y.data(), nt, false, nullptr, nullptr, /*sync_backend*/ false);
             const double t1 = now_s();
             if (s->backend == cpu) t_drain_ram_acc  += t1 - t0;
             else                   t_drain_vram_acc += t1 - t0;
         }
     }
-    void enqueue_one(Store * s) { s->fill(sel.data(), 1); s->enqueue(sel.data(), wts.data(), cur.data(), 1); }
-    void drain_one(Store * s)   { s->drain(y.data(), 1, false, nullptr, nullptr); }
+    void enqueue_one(Store * s) { s->fill(sel.data(), nt); s->enqueue(sel.data(), wts.data(), cur.data(), nt); }
+    void drain_one(Store * s)   { s->drain(y.data(), nt, false, nullptr, nullptr); }
 
-    // one token at `pos` with `nkv` live cells; x = the layer input, l_out = the layer output
-    // (= the next layer's input).  The two arms differ ONLY in the expert block, exactly as in
-    // engine/m1_layer.cpp: the oracle arm runs the monolithic ggml_mul_mat_id sequence, the
-    // store arm runs the product store list (M0's machinery) over the same router output.
-    void forward(ggml_backend_t cpu, int32_t pos, int64_t nkv, const float * x) {
-        const int64_t kidx = pos;
+    // ONE row-array step: `nt` tokens, row t at position pos[t] with nkv[t] live cells from cell
+    // kv_base[t]; x = the layer input [H, nt], l_out = the layer output [H, nt] (= the next
+    // layer's input).  The two arms differ ONLY in the expert block, exactly as in
+    // engine/m1_layer.cpp: the oracle arm runs the monolithic ggml_mul_mat_id sequence, the store
+    // arm runs the product store list (M0's machinery) over the same router output.
+    // B1: the row's live window is the (base, len) pair (engine/m1_layer.h) — row t writes cell
+    // kv_base[t] + pos[t] and attends [kv_base[t], kv_base[t] + nkv[t]).
+    // B2: the per-token scalars became per-row arrays; at nt=1 this is the B1 body exactly (the
+    // same calls, the same order, one row), which is what F2a and the six gates re-prove.  No op
+    // in the layer graph reduces across the token axis, so rows are mathematically independent;
+    // what a batch CAN change is kernel dispatch as a function of the batch width (plan §F).
+    void forward(ggml_backend_t cpu, const int32_t * pos, const int64_t * kv_base,
+                 const int64_t * nkv, const float * x) {
+        for (int t = 0; t < nt; ++t) kidx_buf[(size_t) t] = kv_base[t] + pos[t];
+        const int64_t * kidx = kidx_buf.data();
         // U2b: the layer's pending admissions land HERE — the stream is idle (last position's
         // drain_all synchronized this backend) and this position's enqueue has not been issued.
         if (rot.on) rot_apply_pending();
@@ -1328,8 +1363,8 @@ struct LoopLayer {
         // U5: with the core on ROCm0 the inputs stage through pinned buffers and queue as
         // async H2D on the backend's stream (one stream wait per layer happens in read_taps);
         // the CPU path keeps the exact pre-U5 blocking calls (byte-identity by construction).
-        if (be_core && ly->hstage) ly->set_input_async(x, &pos, &kidx, &nkv, be_core);
-        else                       ly->set_input(x, &pos, &kidx, &nkv);
+        if (be_core && ly->hstage) ly->set_input_async(x, pos, kidx, kv_base, nkv, be_core);
+        else                       ly->set_input(x, pos, kidx, kv_base, nkv);
         t_setin_acc += now_s() - tsi0;
         ggml_backend_t be = be_core ? be_core : cpu;
         if (!store_arm()) {
@@ -1358,7 +1393,7 @@ struct LoopLayer {
                 const double tq = g_instr ? now_s() : 0.0;
                 if (ly->ev_core) ggml_backend_event_synchronize(ly->ev_core);
                 // H3/U4 debug: dump layer-0 pos-0 g_q_nope_abs (flag-ON vs flag-OFF comparison)
-                if (getenv("M4_DUMP_QNA") && ly->layer == 0 && pos == 0) {
+                if (getenv("M4_DUMP_QNA") && ly->layer == 0 && pos[0] == 0) {
                     static bool dumped = false;
                     if (!dumped) {
                         dumped = true;
@@ -1375,7 +1410,7 @@ struct LoopLayer {
                 if (const char * p = getenv("M4_DUMP_ATTN"); p && *p) {
                     static FILE * fa = nullptr;
                     if (!fa) fa = std::fopen(p, "wb");
-                    const uint32_t u32pos = (uint32_t) pos, u32l = (uint32_t) ly->layer;
+                    const uint32_t u32pos = (uint32_t) pos[0], u32l = (uint32_t) ly->layer;   // B2: row 0 (nt==1 paths)
                     // g_attn_out [4096]
                     std::vector<float> ao((size_t) ggml_nelements(ly->g_attn_out));
                     ly->read(ly->g_attn_out, ao.data());
@@ -1412,7 +1447,7 @@ struct LoopLayer {
                 if (const char * pp = getenv("M4_DUMP_PHASE"); pp && *pp) {
                     static FILE * fp = nullptr;
                     if (!fp) fp = std::fopen(pp, "wb");
-                    const uint32_t u32pos = (uint32_t) pos, u32l = (uint32_t) ly->layer;
+                    const uint32_t u32pos = (uint32_t) pos[0], u32l = (uint32_t) ly->layer;   // B2: row 0 (nt==1 paths)
                     ggml_tensor * ts[2] = { ly->g_kcur, ly->g_kqv_mla };
                     for (int t = 0; t < 2; ++t) {
                         const uint32_t n = (uint32_t) ggml_nelements(ts[t]);
@@ -1424,13 +1459,13 @@ struct LoopLayer {
                 }
                 if (g_instr) {
                     t_core_launch_acc += tl - tc0; t_core_taps_acc += tq - tl;
-                    if (pos >= 3) { t_core_launch_ss += tl - tc0; t_core_taps_ss += tq - tl; }
+                    if (pos[0] >= 3) { t_core_launch_ss += tl - tc0; t_core_taps_ss += tq - tl; }
                 }
             } else {
                 ggml_backend_graph_compute(be, ly->gf_core);
             }
             t_core_acc += now_s() - tc0;
-            if (g_instr && pos >= 3) { t_core_acc_ss += now_s() - tc0; ++n_core_ss; }
+            if (g_instr && pos[0] >= 3) { t_core_acc_ss += now_s() - tc0; ++n_core_ss; }
             const double trd0 = now_s();
             if (be_core && ly->hstage) {
                 // U8: in fold mode moe_res (the resident MoE, now in-core) is a sixth tap; in
@@ -1451,12 +1486,17 @@ struct LoopLayer {
             // and the whole CPU-only correctness path) is unchanged.
             if (g_rdump || g_perm) {
                 const int32_t * P = g_perm ? g_perm + (size_t) ly->layer * (size_t) N_EXPERT : nullptr;
+                // B2: one R line per row (nt==1 keeps the exact old single line).
                 if (g_rdump)
-                    std::fprintf(g_rdump, "R %d %d %d %d %d %d %.9e %.9e %.9e %.9e\n",
-                                 ly->layer, (int) pos, sel[0], sel[1], sel[2], sel[3],
-                                 wts[0], wts[1], wts[2], wts[3]);
+                    for (int t = 0; t < nt; ++t)
+                        std::fprintf(g_rdump, "R %d %d %d %d %d %d %.9e %.9e %.9e %.9e\n",
+                                     ly->layer, (int) pos[t], sel[0 + N_USED*t], sel[1 + N_USED*t],
+                                     sel[2 + N_USED*t], sel[3 + N_USED*t],
+                                     wts[0 + N_USED*t], wts[1 + N_USED*t], wts[2 + N_USED*t],
+                                     wts[3 + N_USED*t]);
                 if (P) {
-                    for (int i = 0; i < (int) N_USED; ++i) {
+                    // B2: every row's slots (nt==1 keeps the exact old single-row walk).
+                    for (int i = 0; i < (int) N_USED * nt; ++i) {
                         CHECK(sel[i] >= 0 && sel[i] < (int32_t) N_EXPERT,
                               "router id %d out of range at layer %d", (int) sel[i], ly->layer);
                         sel[i] = P[sel[i]];
@@ -1478,10 +1518,11 @@ struct LoopLayer {
             // checked against the analysis tool's independent re-computation from the route dump:
             // for a SET-backed store this must equal "the hotset's coverage" to the slot.
             if (g_res_stats) {
-                for (int i = 0; i < (int) N_USED; ++i) ++routed_n;   // per slot, not per (slot x VRAM store)
+                // B2: per slot of every row (nt==1 keeps the exact old single-row counts).
+                for (int i = 0; i < (int) N_USED * nt; ++i) ++routed_n;   // per slot, not per (slot x VRAM store)
                 for (Store * s : stores) {
                     if (s->loc != Store::VRAM) continue;
-                    for (int i = 0; i < (int) N_USED; ++i)
+                    for (int i = 0; i < (int) N_USED * nt; ++i)
                         if (s->slot(ly->layer, sel[i]) >= 0) ++served_n;   // safe: the audit enforces one home
                 }
             }
@@ -1500,7 +1541,7 @@ struct LoopLayer {
         // to the store arm (U4e: measured, never claimed).
         const bool fold_arm = store_arm() && ly->g_moe_res != nullptr;
         const std::vector<float> & moe_acc = store_arm() ? y : moe;
-        for (size_t i = 0; i < (size_t) H_DIM; ++i) {
+        for (size_t i = 0; i < (size_t) H_DIM * (size_t) nt; ++i) {
             const float moe_i = fold_arm ? (moe_res[i] + y[i]) : moe_acc[i];
             fout[i]  = moe_i + shexp[i];
             l_out[i] = fout[i] + ffn_inp[i];
@@ -1781,13 +1822,13 @@ static void core_probe_run(GGUFModel & m, ggml_backend_t gpu, int64_t kv_max, in
             for (int t = 0; t < nt; ++t)
                 std::memcpy(&xin[(size_t) H_DIM * t], x0.data(), sizeof(float) * (size_t) H_DIM);
             std::vector<int32_t> pos((size_t) nt);
-            std::vector<int64_t> kidx((size_t) nt), nkv((size_t) nt);
+            std::vector<int64_t> kidx((size_t) nt), base((size_t) nt, 0), nkv((size_t) nt);
             for (int t = 0; t < nt; ++t) {
                 CHECK(pos0 + t < kv_max, "core probe: position %d past the KV width %lld",
                       pos0 + t, (long long) kv_max);
                 pos[t] = pos0 + t; kidx[t] = pos0 + t; nkv[t] = pos0 + t + 1;
             }
-            ly->set_input_async(xin.data(), pos.data(), kidx.data(), nkv.data(), gpu);
+            ly->set_input_async(xin.data(), pos.data(), kidx.data(), base.data(), nkv.data(), gpu);
         }
         // the store phase's idle: CPU-BUSY host time of the same length the product spends in
         // its drive bracket, so the card's clock behaviour matches the product's regime
@@ -1904,9 +1945,10 @@ static void attn_bisection_run(GGUFModel & m, ggml_backend_t gpu, int64_t kv_max
         }
         // stage the inputs once (same position for every layer, as the phase probe does)
         for (int j = 0; j < K; ++j) {
-            std::vector<int32_t> pos(1); std::vector<int64_t> kidx(1), nkv(1);
+            std::vector<int32_t> pos(1); std::vector<int64_t> kidx(1), base(1, 0), nkv(1);
             pos[0] = pos0; kidx[0] = pos0; nkv[0] = pos0 + 1;
-            ly[(size_t) j]->set_input_async(x0.data(), pos.data(), kidx.data(), nkv.data(), gpu);
+            ly[(size_t) j]->set_input_async(x0.data(), pos.data(), kidx.data(), base.data(),
+                                            nkv.data(), gpu);
         }
         auto spin_us = [](int us) {
             if (us <= 0) return;
@@ -1981,9 +2023,10 @@ struct M1Session {
     HeadGraph head;
     std::vector<std::unique_ptr<M1Layer>> layer_own;   // the 36 layers (their ggml buffers)
     std::vector<LoopLayer> L;                          // their per-token buffers + store lists
-    std::vector<float> x;                              // H_DIM: the residual carrier between steps
+    std::vector<float> x;                              // [H, nt]: the residual carrier between steps
     int  n_build_layers = 0;
     int  kv_max = 0;
+    int  nt = 1;                                    // B2: the session's token-batch width (LoopArgs::batch_nt)
     bool rotate = false;                           // --rotate was armed (the reset's guard)
     // U6's per-layer id permutation: ADOPTED from the parser's staging in open(); g_perm points at
     // THIS vector for the rest of the run (it used to be loop_run's function-local static).
@@ -2000,6 +2043,8 @@ struct M1Session {
 
     bool open(const LoopArgs & a);
     bool step(int32_t tok, int pos, float * logits_row);
+    bool step_batch(const int32_t * toks, const int * pos, const int64_t * kv_base,
+                    const int64_t * n_kv, float * logits_rows);
     void reset_rotation();
     void close();
 };
@@ -2032,6 +2077,38 @@ bool M1Session::open(const LoopArgs & a) {
     CHECK(kv_max > 0, "open: kv_max could not be resolved -- --kv-max %d, LoopArgs::seq_len %d, "
           "published boot length %d (a caller with no boot prompt must pass --kv-max or seq_len)",
           a.kv_max, a.seq_len, g_boot_n_total);
+    // ---- B2 — THE BATCHED SESSION'S OWN PRECONDITIONS, refused up front and loudly -----------
+    // The width is a per-binary constant of the numerics (plan §A: the softmax/kqv reduction
+    // runs over the FULL kv_max window for every row), so a batched run must sit in the SAME
+    // window as the solo runs it will be compared against; N divides it into fixed regions.
+    nt = a.batch_nt;
+    CHECK(nt >= 1 && nt <= 8, "open: batch_nt %d out of range [1,8] (plan §E: the head sampler's "
+          "per-row walk and the per-slot buffers are sized for N <= 8)", nt);
+    if (nt > 1) {
+        CHECK(kv_max % nt == 0, "open: kv_max %d is not divisible by the batch width %d — the "
+              "per-sequence region is a FIXED contiguous block of kv_max/%d cells (plan §A option "
+              "ii), and a ragged split would change every slot's base arithmetic", kv_max, nt, nt);
+        CHECK(!a.rotate, "open: --rotate under a batch width of %d is refused — rotation over the "
+              "union is plan §C's B4 unit (the union-driven membership changes the store split's "
+              "float accumulation, so per-sequence equality against a solo run is dead by "
+              "construction); B2 runs STATIC membership (rotation off)", nt);
+        CHECK(!a.fold_resident, "open: --fold-resident is nt==1-gated in the layer build "
+              "(m1_layer.cpp) and is retired besides");
+        CHECK(!a.falsify, "open: the falsifier is a single-token unit and is not wired for a batch");
+        CHECK(a.score_tokens.empty(), "open: --score is the single-sequence teacher-forced walk; "
+              "the batched scoring shape is a later unit's");
+        // B2FIX (review finding 3): an EXPLICIT --m4-wkb/--m4-kqkv/--m4-kvwrite/--m4-wvb (= 1)
+        // would be silently downgraded to stock by the layer build's nt==1 gating — disclosed by
+        // the '# m4 hatches = STOCK' print, but an explicit flag being ignored is the same shape
+        // open() refuses two pages down (explicit --rot-admit-k without --rotate).  Refuse it;
+        // AUTO (-1) still performs the downgrade WITH the disclosure, which is the documented
+        // plan-A fact, not a silent setting.
+        CHECK(a.m4_wkb != 1 && a.m4_kqkv != 1 && a.m4_kvwrite != 1 && a.m4_wvb != 1,
+              "open: an explicit --m4-wkb/--m4-kqkv/--m4-kvwrite/--m4-wvb cannot run at batch "
+              "width %d — the fused m4_* kernels are nt==1-gated (m1_layer.cpp) and would be "
+              "silently downgraded to the stock op sequence; drop the flag (AUTO downgrades WITH "
+              "a printed note) or run the batched stock baseline explicitly", nt);
+    }
     perm_storage = std::move(g_perm_staging);
     if (!perm_storage.empty()) g_perm = perm_storage.data();
     m = GGUFModel::load(a.model.c_str());
@@ -2058,6 +2135,11 @@ bool M1Session::open(const LoopArgs & a) {
     std::printf("# kv width   = %d%s\n", kv_max,
                 a.kv_max > 0 ? "  (pinned: the reference's KV-cache pad, llama-kv-cache.cpp:1285)"
                              : "  (= the sequence length: U2's PRE-FIX width, NOT the reference's)");
+    if (nt > 1)
+        std::printf("# batch nt   = %d — B2 batched decode: ONE step advances %d rows, each with its "
+                    "own (pos, kv_base, len); the KV window is %d cells split into %d fixed regions "
+                    "of %d (plan §A option ii); rotation OFF (static membership)\n",
+                    nt, nt, kv_max, nt, kv_max / nt);
     std::printf("# arm        = %s%s\n",
                 a.do_store ? "store (the product store list)" : "oracle (the monolithic op sequence)",
                 a.do_store ? "" : " — the strict transcription of the reference graph");
@@ -2113,6 +2195,14 @@ bool M1Session::open(const LoopArgs & a) {
         CHECK(a.gpu_core, "--m4-wvb needs --gpu-core (the CPU-only arm must keep the reference "
               "wv_b mul_mat — it is the numerics oracle)");
     if (g_wvb_on) CHECK(!a.falsify, "--m4-wvb is not wired into the falsifier path");
+    // B2: the four m4_* fused kernels are nt==1-gated at BUILD time (m1_layer.cpp:283-296), so a
+    // batched build keeps the STOCK op sequence wherever the hatches would apply — a named
+    // performance fact (plan §A), not something this unit changes.  Say it when it bites: an
+    // AUTO resolution that would have been ON silently becomes stock here.
+    if (nt > 1 && (g_m4_on || g_kqkv_on || g_kvwrite_on || g_wvb_on))
+        std::printf("# m4 hatches = STOCK at nt=%d (the fused m4_* kernels are nt==1-gated; the "
+                    "batched build falls back to the reference op sequence — kernel extension is a "
+                    "later, quality-gated unit)\n", nt);
     // The same argument for the four IN-LOOP INSTRUMENTATION gates (U4FIX item 7): they are read by
     // the layer build below and by forward(), so they are assigned here, not by the caller.
     g_instr              = a.instr;
@@ -2239,8 +2329,8 @@ bool M1Session::open(const LoopArgs & a) {
     // U4: `emb` and `head` are SESSION FIELDS (the public header's configuration block and every
     // position read them), so they are built in place here — NOT as locals that would die with
     // this function and leave step() with null tensors.
-    emb.build(*m, core_be);
-    head.build(*m, core_be);
+    emb.build(*m, core_be, nt);
+    head.build(*m, core_be, nt);
     n_build_layers = a.falsify ? a.f_layers : (int) N_LAYERS;
     std::printf("# head       = output_norm (f32, rms) -> output.weight (q4_K) x %lld = %lld logits\n",
                 (long long) head.n_vocab, (long long) head.n_vocab);
@@ -2250,10 +2340,33 @@ bool M1Session::open(const LoopArgs & a) {
     g_audit_full     = a.audit_full;       // U10: the refresh audit's scope
     g_rot_admit_k    = a.rot_admit_k;      // U10: the 2Q window's threshold (default 2)
     const double t_build0 = now_s();   // U2b: the phase split (build | loop | tail), --instr only
+    // ---- B2FIX (review finding 2): THE KCACHE SENTINEL — a bit-exact common-mode detector ----
+    // The fixed-width frame's two arms run the same code with the same bases, so a
+    // wrong-but-consistent region arithmetic (an off-by-one that reads a cell nobody wrote)
+    // passes every bar identically in both arms.  With the sentinel on, every cell no run ever
+    // writes holds a nonzero sentinel instead of the build's zero fill: a CORRECT engine is
+    // bit-invariant to that (a row only ever reads cells it wrote this run; everything else is
+    // behind -INF, and exp(-inf) = 0 whatever the cell holds), so sentinel-run == zero-run BYTE
+    // for BYTE — while any live read of a never-written cell sees sentinel vs zero and diverges.
+    // This is the class a region TRANSLATION cannot catch (a purely relative off-by-one is
+    // translation-covariant), and translation itself is measured NOT bit-inert at small deltas
+    // (the cell-axis SIMD association finding), so the sentinel is the bit-exact half of the pair.
+    const char * sent_env = std::getenv("M1_KCACHE_SENTINEL");
+    float kcache_sentinel = 0.0f;
+    if (sent_env && *sent_env) {
+        char * e = nullptr;
+        kcache_sentinel = std::strtof(sent_env, &e);
+        CHECK(e != sent_env && *e == '\0' && kcache_sentinel > 0.0f,
+              "M1_KCACHE_SENTINEL='%s' is not a positive float (debug arm: never-written cache "
+              "cells hold this instead of zero)", sent_env);
+        std::printf("# kcache sentinel = ON (%.6g in every cell no run writes — the common-mode "
+                    "region-arithmetic arm; a correct engine is BIT-INVARIANT to it)\n",
+                    (double) kcache_sentinel);
+    }
     L.resize((size_t) n_build_layers);
     // U4: the residual carrier between steps (loop_run's own local before the carve).  It lives in
-    // the session because step() writes it and the post-loop core probe reads it.
-    x.assign((size_t) H_DIM, 0.0f);
+    // the session because step() writes it and the post-loop core probe reads it.  B2: [H, nt].
+    x.assign((size_t) H_DIM * (size_t) nt, 0.0f);
     size_t vram_bytes = 0;      // the split's resident expert bytes (U4a: does it fit?)
     size_t core_bytes = 0;      // U4c: the core's resident bytes (layer bufs + emb + head)
     // H2/U1: the PACKED-COPY accounting (see LoopArgs::footprint) — the bytes each location
@@ -2267,13 +2380,27 @@ bool M1Session::open(const LoopArgs & a) {
         // file then LOADS; the oracle arm on the same file refuses loudly in
         // make_layer_tensor).  U8: in fold mode the layer DOES carry the RESIDENT experts
         // (the fold's mul_mat_id reads them from the core backend).
-        lp->build(*m, l, core_be, kv_max, /*nt*/ 1, a.n_res, a.gpu_core, /*want_oracle*/ !a.do_store,
+        lp->build(*m, l, core_be, kv_max, /*nt*/ nt, a.n_res, a.gpu_core, /*want_oracle*/ !a.do_store,
                   fold_active, a.fold_slots, M1Layer::CORE_STOP_FULL,
                   // H3/U2: the GPU path only — the CPU-only arm keeps the reference expansion
-                  // (it is the numerics oracle gate1 compares byte for byte).
-                  /*attn_expr*/ a.gpu_core ? (a.core_fuse < 0 ? 1 : a.core_fuse) : 0,
+                  // (it is the numerics oracle gate1 compares byte for byte).  B2: the no-copy
+                  // recombination is nt==1-only (m1_layer.cpp guards it), so a batched build
+                  // keeps the reference expansion 0 even on --gpu-core.
+                  /*attn_expr*/ (a.gpu_core && nt == 1) ? (a.core_fuse < 0 ? 1 : a.core_fuse) : 0,
                   /*m4_wkb*/ g_m4_on, /*m4_kqkv*/ g_kqkv_on,
                   /*m4_kvwrite*/ g_kvwrite_on, /*m4_wvb*/ g_wvb_on);
+        // B2FIX: the sentinel fill replaces the build's zero-memset in every cell this session
+        // will not write (the F16 row bytes of the whole cache — rows written later by set_rows
+        // overwrite their cells before any read can see the sentinel).
+        if (kcache_sentinel > 0.0f) {
+            std::vector<uint8_t> sf((size_t) ggml_nbytes(lp->kcache));
+            const size_t n16 = sf.size() / 2;
+            ggml_fp16_t w16;
+            ggml_fp32_to_fp16_row(&kcache_sentinel, &w16, 1);
+            for (size_t i = 0; i < n16; ++i)
+                std::memcpy(sf.data() + 2 * i, &w16, 2);
+            ggml_backend_tensor_set(lp->kcache, sf.data(), 0, sf.size());
+        }
         std::vector<Store *> keep;
         if (a.do_store) {
             // H1: the layer's ORDERED resident set (nullptr => the identity interval [0,n_res),
@@ -2288,7 +2415,7 @@ bool M1Session::open(const LoopArgs & a) {
                 // --gpu-store), RAM on the CPU.  Off, the `cpu` backend for every entry keeps
                 // exactly the previous (byte-identical) behaviour.
                 ggml_backend_t be = (a.gpu_store && sp.loc == Store::VRAM) ? gpu : cpu;
-                Store * s = make_store(sp, lp->gu_lt, lp->dn_lt, be, 1);
+                Store * s = make_store(sp, lp->gu_lt, lp->dn_lt, be, nt);   // B2: the store's (c,n) graph set is built nt wide
                 keep.push_back(s);
                 if (a.gpu_store && sp.loc == Store::VRAM)
                     for (const Slice & sl : s->slices) vram_bytes += sl.gu_nbytes + sl.d_nbytes;
@@ -2329,11 +2456,11 @@ bool M1Session::open(const LoopArgs & a) {
             // overhead of the list loop and nothing else.  Numerics-neutral by construction.
             for (int k = 0; k < a.extra_stores; ++k) {
                 Store * s = new Store();
-                s->build(Store::RAM, lp->gu_lt, lp->dn_lt, 0, 0, cpu, 1);
+                s->build(Store::RAM, lp->gu_lt, lp->dn_lt, 0, 0, cpu, nt);
                 keep.push_back(s);
             }
         }
-        L[(size_t) l].init(lp);
+        L[(size_t) l].init(lp, nt);   // B2: the per-token host buffers are [*, nt]
         L[(size_t) l].stores = keep;
         L[(size_t) l].be_core = a.gpu_core ? gpu : nullptr;
         if (a.gpu_core) core_bytes += ggml_backend_buffer_get_size(lp->buf);
@@ -2500,17 +2627,68 @@ bool M1Session::step(int32_t tok, int pos, float * logits_row) {
                      "zero mask\n", pos, kv_max);
         return false;
     }
+    // B2FIX (review finding 1): this is the nt=1 instance ONLY.  The one-element stack arrays
+    // below feed step_batch, which walks s->nt rows — on a batch-width-N session it would read
+    // toks[1..]/pos[1..]/kv_base[1..]/n_kv[1..] past the locals (UB) and, past the per-row checks,
+    // head.run_n would write n_vocab*nt floats into the caller's ONE n_vocab row.  Refuse loudly,
+    // the same style as open()'s other nt>1 refusals; the batch-width session has its own seam.
+    if (nt != 1) {
+        std::fprintf(stderr, "FAIL: m1_session_step on a batch-width-%d session — the scalar step "
+                     "is the nt=1 seam; drive an N-row session with m1_session_step_batch "
+                     "(refusing rather than reading one row's arguments for %d)\n", nt, nt);
+        return false;
+    }
+    // B2: the nt=1 instance of the ONE body — same calls, same order, one row, so there are not
+    // two per-position bodies to drift and the gates' byte identity covers the merge.
+    const int32_t tok1 = tok;
+    const int     pos1 = pos;
+    const int64_t base1 = 0, len1 = pos + 1;   // the exact pre-B2 semantics: one window from cell 0
+    return step_batch(&tok1, &pos1, &base1, &len1, logits_row);
+}
+
+// B2 — THE N-ROW BODY (the contract is engine/m1_session.h's).  Row t: embedding of toks[t] ->
+// every layer with (pos[t], kv_base[t], n_kv[t]) -> an optional head row.  `x` is [H, nt]; each
+// layer's l_out replaces it wholesale, exactly as the nt=1 body always did.
+bool M1Session::step_batch(const int32_t * toks, const int * pos, const int64_t * kv_base,
+                           const int64_t * n_kv, float * logits_rows) {
+    if (!m || L.empty()) return false;
+    for (int t = 0; t < nt; ++t) {
+        // THE NO-LIVE-CELL REFUSAL (plan §D's pad discipline): a row with n_kv < 1 is all
+        // -INFINITY and soft_max_ext turns that into NaN through exp(-inf - (-inf)); a padded row
+        // must keep ONE live cell inside its own region.  Refuse instead of serving the NaN.
+        if (n_kv[t] < 1) {
+            std::fprintf(stderr, "FAIL: m1_session_step_batch: row %d has n_kv %lld — no live cell, "
+                         "so its mask row is all -INFINITY and softmax produces NaN "
+                         "(exp(-inf - (-inf))); a padded row must keep one live cell in its own "
+                         "region (plan D)\n", t, (long long) n_kv[t]);
+            return false;
+        }
+        if (pos[t] < 0 || pos[t] >= kv_max) {
+            std::fprintf(stderr, "FAIL: m1_session_step_batch: row %d pos %d outside [0,%d) — the "
+                         "run's KV width is exceeded; refusing rather than writing past the cache "
+                         "and attending a zero mask\n", t, pos[t], kv_max);
+            return false;
+        }
+        if (kv_base[t] < 0 || kv_base[t] + pos[t] >= kv_max || kv_base[t] + n_kv[t] > kv_max) {
+            std::fprintf(stderr, "FAIL: m1_session_step_batch: row %d region [base %lld, base+len "
+                         "%lld) with write cell %lld leaves the KV window [0,%d) — the caller owns "
+                         "the per-sequence region arithmetic (plan A option ii)\n",
+                         t, (long long) kv_base[t], (long long) (kv_base[t] + n_kv[t]),
+                         (long long) (kv_base[t] + pos[t]), kv_max);
+            return false;
+        }
+    }
     const double te0 = now_s();
-    emb.run(core_be, tok, x.data());
+    emb.run_n(core_be, toks, nt, x.data());
     t_emb_acc += now_s() - te0;
     // `L.size()`, not N_LAYERS: --falsify builds only a.f_layers of them (U4FIX item 8).
     for (size_t l = 0; l < L.size(); ++l) {
-        L[l].forward(cpu, pos, pos + 1, x.data());
+        L[l].forward(cpu, pos, kv_base, n_kv, x.data());
         x = L[l].l_out;
     }
-    if (!logits_row) return true;
+    if (!logits_rows) return true;
     const double th0 = now_s();
-    head.run(core_be, x.data(), logits_row);
+    head.run_n(core_be, x.data(), logits_rows, nt);
     t_head_acc += now_s() - th0;
     ++n_head_calls;
     return true;
@@ -2662,6 +2840,13 @@ bool m1_session_open(const LoopArgs & a, M1Session ** out) {
 }
 bool m1_session_step(M1Session * s, int32_t tok, int pos, float * logits_row) {
     return s && s->step(tok, pos, logits_row);
+}
+bool m1_session_step_batch(M1Session * s, int nt, const int32_t * toks, const int * pos,
+                           const int64_t * kv_base, const int64_t * n_kv, float * logits_rows) {
+    CHECK(s && nt == s->nt, "m1_session_step_batch: nt %d != the session's build width %d — the "
+          "graphs, buffers and stores were sized for %d row(s); reopen the session at the wanted "
+          "width", nt, s->nt, s->nt);
+    return s->step_batch(toks, pos, kv_base, n_kv, logits_rows);
 }
 void m1_session_reset_rotation(M1Session * s) { if (s) s->reset_rotation(); }
 int  m1_session_kv_max(const M1Session * s)   { return s ? s->kv_max : 0; }
@@ -2947,7 +3132,8 @@ int loop_run(const LoopArgs & a) {
                 LoopLayer & ly = S->L[(size_t) l];
                 const int32_t pos = 0;
                 const int64_t kidx = 0, nkv = 1;
-                ly.ly->set_input(x.data(), &pos, &kidx, &nkv);
+                const int64_t base = 0;   // B1 seam: the single window starts at cell 0
+                ly.ly->set_input(x.data(), &pos, &kidx, &base, &nkv);
                 ggml_backend_graph_compute(ly.be_core ? ly.be_core : S->cpu, ly.ly->gf_core);
                 ly.ly->read(ly.ly->g_cur, ly.cur.data());
                 ly.ly->read(ly.ly->g_sel, ly.sel.data());

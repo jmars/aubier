@@ -186,6 +186,19 @@ struct LoopArgs {
     // is per request) sets this ONE field and needs no global — it is the per-session half of the
     // resolution.  Every other field above is the verbatim m1_engine.cpp struct.
     int    seq_len = 0;
+    // ---- B2 — THE TOKEN-BATCH WIDTH (the batched session's one knob) -----------------------
+    // 1 (the default, and the ONLY value loop_run and the server ever set) is today's engine
+    // exactly: one token, one sequence, base 0, len pos+1 — every graph, buffer and store is
+    // built at nt=1 and the bytes cannot move (that is F2a and the six gates' claim).  N > 1
+    // builds the SAME session N wide (embedding/head/layer graphs and every store's (c,n) graph
+    // set) and is the batch-of-N decode seam: one step advances N rows, each with its own
+    // (tok, pos, kv_base, len) — see m1_session_step_batch.  The KV cache stays ONE window of
+    // width `kv_max` (plan §A option ii): the CALLER partitions it into per-sequence regions and
+    // owns the arithmetic (base_s = s * kv_max/N, capacity kv_max/N) — the batch test rig and,
+    // later, the server's assembler.  Rotation (2Q) and the resident fold are REFUSED at N > 1:
+    // rotation under a batch is plan §C's B4 unit (the union-driven membership breaks per-sequence
+    // equality by construction), and the fold is nt==1-gated in the layer build.
+    int    batch_nt = 1;
 };
 
 // ---------------------------------------------------------------------------
@@ -264,7 +277,35 @@ void m1_session_boot_prompt(const std::vector<int32_t> * ids, int n_prompt, int 
 // zero mask (the m1 binary's structural `kv_max >= n_total` guard is a CALLER contract here), and
 // when the session was never opened.  A caller must therefore budget its positions against
 // m1_session_kv_max().
+//
+// B1 — THE SEAM IS NOW (base, len), NOT A BARE LENGTH: the layer's rows carry a per-row live
+// window (engine/m1_layer.h, set_input: mask 0 on [base, base+len), kidx = base+pos) and this step
+// is the N = 1 instance of it — ONE row, base 0, len pos+1 — so the semantics and the bytes are
+// exactly the pre-B1 ones.  Multi-sequence stepping (per-row regions, nt > 1, the assembler) is
+// NOT implemented here; this is the seam it will be expressed through, which is why the numbers
+// cannot move today.
 bool m1_session_step(M1Session * s, int32_t tok, int pos, float * logits_row);
+
+// B2 — THE BATCHED STEP: `nt` rows in ONE engine step, each row t carrying its own token
+// `toks[t]`, its own position `pos[t]` (which writes KV cell `kv_base[t] + pos[t]` of the ONE
+// shared cache), and its own live window [kv_base[t], kv_base[t] + n_kv[t]) — every cell outside
+// it masked.  `logits_rows` (when non-null) receives nt consecutive n_vocab-float rows, row t for
+// token t; null skips the head for the WHOLE batch (the caller's decision, as in step).
+//
+// This is the N-row instance of the SAME per-position body step() runs — step() is the nt=1
+// wrapper over it, so there is ONE body and the six gates' byte identity covers the merge.  The
+// per-token math is per-column (no op in the layer graph reduces across the token axis); what a
+// batch CAN change is kernel dispatch/tiling as a function of the batch width — that is a
+// measurement (plan §F risk 1), which is why every equality claim against a solo run is made at
+// the SAME kv_max and the same op set.
+//
+// REFUSES (false + stderr, no partial step) when any row's position is outside [0, kv_max), when
+// a row's region leaves the window, or when a row has NO live cell (n_kv[t] < 1): an all-masked
+// row is all -INFINITY and softmax turns it into NaN through exp(-inf - (-inf)) — a padded row
+// must keep ONE live cell in its own region (plan §D).  Rows must not share a KV write cell:
+// ggml_set_rows with duplicate indices is a race, so disjoint regions are the caller's invariant.
+bool m1_session_step_batch(M1Session * s, int nt, const int32_t * toks, const int * pos,
+                           const int64_t * kv_base, const int64_t * n_kv, float * logits_rows);
 
 // Put the rotation policy back to its BOOT state so a second run of positions equals a fresh-boot
 // one: the 2Q state (ghost window, slot stamps, pending/candidate queues, the per-layer counters)

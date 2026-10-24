@@ -26,6 +26,12 @@
 //
 // `generate` reports every produced token through `sink` and asks `cancel` between positions
 // only — never inside one (plan §E: an aborted request must not leave pending store work).
+//
+// B3 — THE BATCH ASSEMBLER (--batch-slots N > 1, plan §D): the same seam's batch_* methods
+// (m1_engine_api.h) driven by ONE worker thread over N slots — a joiner prefills alone, then
+// every live slot advances one position per engine step; a departed slot is padded inside its
+// own region.  The single-flight path below is untouched and remains the whole server at the
+// default N=1 (Bar A: byte-identical to the pre-B3 server).
 
 //
 // THE FAKE ENGINE, documented so a test can predict it exactly (scripts/engine_gate_http.sh
@@ -77,11 +83,14 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <condition_variable>
 #include <time.h>
 #include <vector>
 
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define FATAL(...) do { \
@@ -222,7 +231,10 @@ static std::string render_chat_prompt(const std::vector<ChatMsg> & messages);
 
 struct FakeEngine : M1Engine {
     EngineCfg cfg;
-    explicit FakeEngine(const EngineCfg & c) : cfg(c) {}
+    explicit FakeEngine(const EngineCfg & c) : cfg(c) {
+        f_n = c.batch_slots < 1 ? 1 : c.batch_slots;
+        fslots.assign((size_t) f_n, FSlot());
+    }
 
     const char * name() const override { return "fake"; }
     int n_vocab() const override { return 1024; }
@@ -261,6 +273,21 @@ struct FakeEngine : M1Engine {
         return true;
     }
 
+    // The row the fake's sampler sees at `step` — the cycle ids hashed from (seed, step), with
+    // this step's greedy id pinned at 2.0.  ONE construction shared by the solo pick() and the
+    // batched row fill below, so the fake's batched greedy chain IS the solo chain by
+    // construction (the engine-side M-dispatch divergence L90 measured does not exist here).
+    void fake_row(float * row, int n, uint64_t seed, int step) const {
+        std::fill(row, row + n, -30.0f);
+        const int32_t greedy = FAKE_CYCLE[(size_t) (step % FAKE_CYCLE_N)];
+        uint64_t x = seed ^ 0x9E3779B97F4A7C15ull ^ ((uint64_t) step << 32);
+        for (int k = 0; k < FAKE_CYCLE_N; ++k) {
+            const uint64_t h = m1_splitmix64(x);
+            row[(size_t) FAKE_CYCLE[k]] = (float) ((double) (h >> 40) / 16777216.0 * 2.0 - 1.0);
+        }
+        row[(size_t) greedy] = 2.0f;
+    }
+
     int32_t pick(int step, const Sampling & sp) const {
         const int32_t greedy = FAKE_CYCLE[(size_t) (step % FAKE_CYCLE_N)];
         if (!(sp.temperature > 0.0)) return greedy;
@@ -268,12 +295,7 @@ struct FakeEngine : M1Engine {
         // EOS included, sits far below the cut), so a sampled chain is a re-ordering of the
         // same pieces and no arm can be surprised by an accidental EOS.
         std::vector<float> row((size_t) n_vocab(), -30.0f);
-        uint64_t x = sp.seed ^ 0x9E3779B97F4A7C15ull ^ ((uint64_t) step << 32);
-        for (int k = 0; k < FAKE_CYCLE_N; ++k) {
-            const uint64_t h = m1_splitmix64(x);
-            row[(size_t) FAKE_CYCLE[k]] = (float) ((double) (h >> 40) / 16777216.0 * 2.0 - 1.0);
-        }
-        row[(size_t) greedy] = 2.0f;  // favoured, not dominant: sampling genuinely wanders
+        fake_row(row.data(), n_vocab(), sp.seed, step);
         uint64_t seed_state = sp.seed;
         uint64_t rng = m1_splitmix64(seed_state) ^ ((uint64_t) step * 0x2545F4914F6CDD1Dull);
         return m1_sample_row(row.data(), n_vocab(), sp, rng);
@@ -299,6 +321,108 @@ struct FakeEngine : M1Engine {
         r.finish = "length";
         return r;
     }
+
+    // ---- B3: the fake's minimal batched mode (plan §H: the assembler must be gateable
+    // WITHOUT a GPU).  No KV cache and no regions IN FACT, but the SAME CONTRACT
+    // (m1_engine_api.h): per-slot position/budget bookkeeping, join/depart, and a per-slot
+    // row whose greedy argmax is the SOLO chain's pick(sample index) — so the fake's batched
+    // greedy answer EQUALS its single-flight answer, and every assembler bug (wrong slot,
+    // wrong attribution, a pad advancing, a lost position) shows in the ids.  The per-request
+    // stream is SLOT-INDEPENDENT (m1_request_rng(0, req_seed, 0)): a bar must not depend on
+    // which slot a request happens to land in.
+    struct FSlot {
+        int st = 0;          // 0 = never joined, 1 = live, 2 = departed
+        int pos = 0;         // the next position a live row feeds
+        int n_prompt = 0;
+        int max_pos = 0;     // the last position the budgeted walk ever feeds
+        uint64_t seed = 0;   // the request's sp.seed (the fake row hashes it per step)
+    };
+    int             f_n = 1;
+    std::vector<FSlot> fslots;
+
+    int n_batch_slots() const override { return f_n; }
+    int batch_slot_cap() const override { return f_n <= 1 ? cfg.kv_max : cfg.kv_max / f_n; }
+
+    bool batch_join(int slot, int n_prompt, int max_tokens, uint64_t req_seed,
+                    uint64_t * rng, std::string * err) override {
+        if (slot < 0 || slot >= f_n) {
+            if (err) *err = "batch_join: slot " + std::to_string(slot) + " out of range [0," +
+                            std::to_string(f_n) + ")";
+            return false;
+        }
+        const long long cap = batch_slot_cap();
+        if ((long long) n_prompt + max_tokens > cap) {
+            if (err) *err = "batch_join: prompt " + std::to_string(n_prompt) + " + max_tokens " +
+                            std::to_string(max_tokens) + " exceeds the per-slot region " +
+                            std::to_string(cap) + " — the router's clamp should have prevented this";
+            return false;
+        }
+        FSlot & f = fslots[(size_t) slot];
+        f.st = 0;
+        f.pos = 0;
+        f.n_prompt = n_prompt;
+        f.max_pos = n_prompt + max_tokens - 2;   // positions n_prompt-1 .. this one carry rows
+        f.seed = req_seed;
+        if (rng) *rng = m1_request_rng(0, req_seed, 0);
+        return true;
+    }
+
+    // TEST HOOK (B3FIX A1's probe), deliberately NOT a feature: M1_BATCH_POISON_STEP=1 makes
+    // the fake refuse its FIRST composed step, driving the assembler's poison path on demand
+    // (poison is otherwise unreachable in a correct build — by contract it means an
+    // assembler bug).  Announced at boot like every other hook; off unless the env says so.
+    static bool mutant_poison_step() {
+        const char * m = std::getenv("M1_BATCH_POISON_STEP");
+        return m && std::strcmp(m, "1") == 0;
+    }
+
+    bool batch_step(const int32_t * tok, const bool * live, float * rows,
+                    std::string * err) override {
+        (void) tok;   // the fake's chain is position-determined and prompt-independent (documented)
+        if (mutant_poison_step()) {
+            static bool fired = false;
+            if (!fired) {
+                fired = true;
+                if (err) *err = "MUTANT M1_BATCH_POISON_STEP: the first composed step is refused";
+                return false;
+            }
+        }
+        // the fake's per-token sleep applies to the batched step too (once per STEP, the
+        // engine-step cost analogue): without it the concurrency arms' windows are empty and
+        // --fake-delay-ms would only mean anything on the single-flight path.
+        if (cfg.fake_delay_ms > 0) {
+            struct timespec ts;
+            ts.tv_sec  = cfg.fake_delay_ms / 1000;
+            ts.tv_nsec = (long) (cfg.fake_delay_ms % 1000) * 1000000L;
+            nanosleep(&ts, nullptr);
+        }
+        const int nv = n_vocab();
+        for (int t = 0; t < f_n; ++t) {
+            FSlot & f = fslots[(size_t) t];
+            float * row = rows + (size_t) t * (size_t) nv;
+            std::fill(row, row + nv, 0.0f);   // pad rows are UNSPECIFIED by contract; keep them tame
+            if (!live[t]) continue;
+            if (f.st == 0) f.st = 1;
+            if (f.pos > f.max_pos) {
+                if (err) *err = "fake batch_step: slot " + std::to_string(t) +
+                                " walked past its budgeted positions (an assembler bug)";
+                return false;
+            }
+            // sample index of position p = p - n_prompt + 1 (position n_prompt-1's row is the
+            // first sampled id — the same mapping the real engine's solo decode uses).  The
+            // earlier prefill positions carry NO sample: their row is never read by the
+            // assembler, and the index would be negative here.
+            if (f.pos >= f.n_prompt - 1)
+                fake_row(row, nv, f.seed, f.pos - f.n_prompt + 1);
+            ++f.pos;
+        }
+        return true;
+    }
+
+    void batch_depart(int slot) override {
+        if (slot >= 0 && slot < f_n) fslots[(size_t) slot].st = 2;
+    }
+    void batch_log(int, const std::vector<int32_t> &) override {}   // the fake keeps no request log
 };
 
 #ifdef M1_ENGINE_REAL
@@ -454,6 +578,14 @@ struct Server {
     std::timed_mutex                flight;   // SINGLE FLIGHT: one engine, one KV, one rotation
     std::atomic<unsigned long long> requests{0};
     bool                            verbose = false;
+    // B3 — THE BATCH ASSEMBLER (--batch-slots N > 1, plan §D).  At the default 1 `pool` is
+    // null and the single-flight path above IS the whole server, byte for byte as it was: the
+    // assembler is reached only through explicit configuration, exactly like every other
+    // default-off mechanism in this engine.  --queue-wait-ms governs only the single-flight
+    // wait; at N > 1 seating is bounded by batch_window_ms instead.
+    int                             batch_slots = 1;
+    int                             batch_window_ms = 10;
+    struct BatchPool *              pool = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -770,6 +902,46 @@ static bool apply_budget(M1Engine * e, GenRequest & g, ApiError & err) {
 }
 
 // ---------------------------------------------------------------------------
+// B3 — THE PER-SLOT BUDGET (plan §D): apply_budget's arithmetic against the slot's REGION
+// (kv_max / N) instead of the global window.  The 400's extra members name the slot region
+// ({prompt_tokens, kv_max_slot}) and the clamp is region-relative; everything else mirrors
+// apply_budget exactly.  NEVER CALLED at batch_slots == 1 — that path is apply_budget above,
+// untouched and byte-identical to the pre-B3 server (Bar A).
+// ---------------------------------------------------------------------------
+static bool apply_budget_slot(Server & srv, GenRequest & g, ApiError & err) {
+    M1Engine * e = srv.engine;
+    const long long n_prompt = (long long) g.prompt.size();
+    const long long kv_slot  = (long long) e->batch_slot_cap();
+    if (n_prompt >= kv_slot) {
+        err.status  = 400;
+        err.type    = "invalid_request_error";
+        err.param   = "prompt";
+        err.code    = "prompt_too_long";
+        err.message = "prompt has " + std::to_string(n_prompt) + " tokens, which is not less than "
+                      "the per-slot region (" + std::to_string(kv_slot) + " = kv_max " +
+                      std::to_string(e->kv_max()) + " / " + std::to_string(srv.batch_slots) +
+                      " slots)";
+        err.extra = "\"prompt_tokens\":" + std::to_string(n_prompt) + ",\"kv_max_slot\":" +
+                    std::to_string(kv_slot);
+        return false;
+    }
+    const long long room = kv_slot - n_prompt;
+    if (g.requested < 0 || g.requested > room) {
+        if (g.requested >= 0) {
+            g.clamped = true;
+            std::fprintf(stderr,
+                         "m1_server: max_tokens CLAMPED %lld -> %lld (prompt %lld + max_tokens "
+                         "would exceed the per-slot region %lld); finish_reason will be \"length\"\n",
+                         g.requested, room, n_prompt, kv_slot);
+        }
+        g.max_tokens = room;
+    } else {
+        g.max_tokens = g.requested;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // SSE output
 // ---------------------------------------------------------------------------
 static std::string chunk_prefix(const std::string & id, long long created, const std::string & model,
@@ -887,8 +1059,35 @@ static void log_done(const Server & srv, unsigned long long no, const m1http::Re
                  stream ? " (stream)" : "");
 }
 
+// THE ONE 503 SHAPE (B3 reuses it verbatim for a request that cannot be seated within
+// --batch-window-ms — the same status/type/code/Retry-After, the message names who holds the
+// engine).  `slots` <= 0 prints the single-flight message, byte-identical to the pre-B3
+// server's two inline copies, which this replaces.
+static void send_engine_busy(m1http::Conn & c, int slots) {
+    ApiError e;
+    e.status  = 503;
+    e.type    = "server_error";
+    e.message = slots > 0
+                    ? "engine busy: all " + std::to_string(slots) +
+                          " batch slots are held; retry after 1s"
+                    : "engine busy: another request holds the single-flight engine; retry after 1s";
+    e.code    = "engine_busy";
+    e.headers = "Retry-After: 1\r\n";
+    send_api_error(c, e);
+}
+
+// (B3) defined below, after BatchPool: the batched driver run_generation dispatches to.
+static void run_batch_generation(Server & srv, m1http::Conn & c, const m1http::Request & rq,
+                                 unsigned long long no, GenRequest & g, bool debug_route);
+
 static void run_generation(Server & srv, m1http::Conn & c, const m1http::Request & rq,
                            unsigned long long no, GenRequest & g) {
+    // B3: at --batch-slots > 1 the single-flight mutex does not exist; the assembler owns the
+    // engine.  Everything above this line (validation, budget, encode) already ran.
+    if (srv.pool) {
+        run_batch_generation(srv, c, rq, no, g, /*debug_route=*/false);
+        return;
+    }
     // ---- single flight. A second request waits a bounded time and is then refused with
     // 503 + Retry-After, never run concurrently against the one engine (plan §E).
     std::unique_lock<std::timed_mutex> lock(srv.flight, std::defer_lock);
@@ -899,13 +1098,7 @@ static void run_generation(Server & srv, m1http::Conn & c, const m1http::Request
         got = lock.try_lock_for(std::chrono::milliseconds(srv.queue_wait_ms));
     }
     if (!got) {
-        ApiError e;
-        e.status  = 503;
-        e.type    = "server_error";
-        e.message = "engine busy: another request holds the single-flight engine; retry after 1s";
-        e.code    = "engine_busy";
-        e.headers = "Retry-After: 1\r\n";
-        send_api_error(c, e);
+        send_engine_busy(c, 0);
         return;
     }
 
@@ -1043,6 +1236,651 @@ static void run_generation(Server & srv, m1http::Conn & c, const m1http::Request
     log_done(srv, no, rq, finish, n_prompt, n_completion, false);
 }
 
+// B3FIX A2 — the batch worker's per-chunk send deadline.  m1http sets no send timeout, so a
+// stream client that stops reading could otherwise park the worker in send_all indefinitely;
+// with the deadline the write fails, the conn dies, and the slot departs at that position
+// boundary (padded).  10 s for ONE small SSE chunk is generous by orders of magnitude — a
+// live reader drains it in milliseconds — and it also bounds the request thread's own tail
+// writes on the same conn, which fail the same honest way (no body to a client that is gone).
+static constexpr int kBatchSendTimeoutMs = 10000;
+
+// ---------------------------------------------------------------------------
+// B3 — THE BATCH ASSEMBLER (plan §D).  N slots, ONE worker thread stepping the engine once
+// per batch position, per-slot condition variables, --batch-window-ms as both the formation
+// window (an empty pool holds the first prefill up to W ms so a burst can share steps) and
+// the seating deadline (all N slots busy for W ms => the single-flight server's own 503
+// shape).  This struct exists ONLY at srv.batch_slots > 1; the single-flight path above is
+// the whole server otherwise.
+//
+// THE DISCIPLINE (plan §B/§D — exactly the B2 rig's, with the row composition moved into the
+// engine so it cannot drift per engine):
+//   * a joiner PREFILLS ALONE: while its prompt walks, every other slot is padded or FROZEN
+//     (an idempotent replay of its last fed position — same tok, same pos, same window, so
+//     the KV write lands on the same cell with the same bytes and a waiting slot's state
+//     cannot move);
+//   * then it joins the decode batch: every live slot advances ONE position of its own
+//     sequence per engine step;
+//   * a departing slot (EOS, stop string, length, cancel, client gone) is PADDED at a
+//     position boundary — a one-cell window inside its OWN region; live slots are untouched;
+//   * no chunked prefill, no prefill/decode interleave inside one step, no compaction: a
+//     freed region is claimed by the next joiner, which rewrites every cell it attends.
+//
+// THREADING.  The worker owns every slot's walk; a request thread owns its conn from claim
+// to publish (the SSE head) and again after the wake (the tail) — while it is parked the
+// worker is the only writer, so the conn is never touched by two threads at once.  All
+// state changes are under `mu`.  A client that stops READING can park the worker inside a
+// socket write exactly as it parks the single-flight engine today (m1http sets no send
+// timeout) — with N requests on it instead of one; that is the named cost of this design,
+// not a regression the wire layer can fix.
+// ---------------------------------------------------------------------------
+struct BatchPool {
+    Server &   srv;
+    M1Engine * eng;        // == srv.engine
+    const int  n;
+    const int  window_ms;
+
+    struct Slot {
+        enum St { FREE, PREPARING, SEATED, PREFILL, DECODE, FINISHED };
+        St st = FREE;
+        std::condition_variable cv;   // this slot's request thread parks here
+        // ---- request context (the request thread fills between claim and publish) ----
+        GenRequest          g;        // BY VALUE: the caller's frame parks with us
+        m1http::Conn *      conn = nullptr;
+        std::string         rid;      // "chatcmpl-<no>" / "cmpl-<no>"
+        long long           created = 0;
+        unsigned long long  no = 0;
+        bool                debug_route = false;
+        // ---- walk state (the worker's) ----
+        int      fed = 0;            // prompt ids fed so far
+        int32_t  tok_in = 0;         // the id the next decode step feeds
+        uint64_t rng = 0;            // this request's own stream (plan §E)
+        StopMatcher sm;
+        std::string text;            // non-stream accumulation
+        bool client_gone = false;
+        // ---- result (the worker fills; the request thread reads after the wake) ----
+        std::vector<int32_t> ids;
+        const char * finish = "length";   // the RAW finish: "stop" | "length" | "cancelled"
+        std::string error;                // non-empty => 500 (non-stream) / end the stream
+    };
+    std::vector<Slot>     slots;
+    std::mutex            mu;
+    std::condition_variable pool_cv;     // seat() waiters + the worker's formation wait
+    std::thread           worker;
+    bool                  stop_flag = false;   // set once, from shutdown_and_join()
+    bool                  worker_done = false; // A1: set under mu after join(); nobody else can
+                                               // finish a slot past this point
+    bool                  poisoned  = false;   // an engine refusal: nothing honest can be served
+    std::string           poison_why;
+    std::chrono::steady_clock::time_point pending_since{};   // the formation window's start
+    // the occupancy instrument — an OBSERVATION on this boot, never a product number
+    unsigned long long steps = 0, live_sum = 0, joins = 0, departures = 0;
+
+    BatchPool(Server & s, int window)
+        : srv(s), eng(s.engine), n(s.batch_slots), window_ms(window),
+          slots((size_t) s.batch_slots) {}
+
+    Slot & slot(int s) { return slots[(size_t) s]; }
+
+    void start() { worker = std::thread([this] { work(); }); }
+
+    // ---- the request thread's side --------------------------------------------------------
+    // Claim a FREE slot within window_ms.  Returns the slot index with st == PREPARING (the
+    // worker cannot see it yet); -1 = the window expired (the caller sends the 503 shape);
+    // -2 = the pool is poisoned or shutting down (the caller sends the 500 / nothing).
+    int claim(const GenRequest & g, m1http::Conn & c, unsigned long long no, bool debug_route) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lk(mu);
+        for (;;) {
+            if (poisoned || stop_flag) return -2;
+            for (int s = 0; s < n; ++s) {
+                Slot & q = slots[(size_t) s];
+                if (q.st != Slot::FREE) continue;
+                q.st = Slot::PREPARING;
+                q.g = g;   // the copy keeps prompt/sp/stops alive past the park
+                q.conn = &c;
+                q.rid = (g.chat ? "chatcmpl-" : "cmpl-") + std::to_string(no);
+                q.created = (long long) ::time(nullptr);
+                q.no = no;
+                q.debug_route = debug_route;
+                // a FULL reset — a stale field here would leak into the next request
+                q.fed = 0;
+                q.tok_in = 0;
+                q.rng = 0;
+                q.text.clear();
+                q.client_gone = false;
+                q.ids.clear();
+                q.finish = "length";
+                q.error.clear();
+                // a FULL reset — a stale field here would leak into the next request.  The
+                // stop matcher needs a whole-fresh object: init() alone does NOT clear
+                // matched/text/emitted (the single-flight path always constructs a fresh one,
+                // so it never had to).
+                q.sm = StopMatcher();
+                q.sm.init(g.stops);
+                return s;
+            }
+            if (window_ms <= 0) return -1;
+            const auto deadline = t0 + std::chrono::milliseconds(window_ms);
+            pool_cv.wait_until(lk, deadline);   // the re-scan on the next loop sees a late free
+            if (std::chrono::steady_clock::now() >= deadline) return -1;
+        }
+    }
+
+    // Make the prepared slot visible to the worker (the SSE head, if any, is already written).
+    // A1: if the pool died (poison, or the worker exited) between claim and here, the worker's
+    // sweeps have already finished this slot as PREPARING — seating it now would overwrite
+    // FINISHED into a pool nobody will ever step, and wait_done would park the handler forever.
+    // Finish it instead: q.error set, so the tail answers the 500 the poisoned pool owes it
+    // (a stream just ends — no honest finish_reason exists, exactly like the sweep).
+    // TEST HOOK (B3FIX A1's probe), deliberately NOT a feature: M1_BATCH_PUBLISH_DELAY_MS=N
+    // sleeps N ms BEFORE seating a slot, holding the request thread in the claim->publish
+    // window (the window that otherwise contains only the fast SSE head writes, too narrow
+    // to hit a sweep by scheduling).  Announced at boot; off unless the env says so.
+    static int publish_delay_ms() {
+        const char * m = std::getenv("M1_BATCH_PUBLISH_DELAY_MS");
+        return m ? std::atoi(m) : 0;
+    }
+
+    void publish(int s) {
+        {
+            const int pd = publish_delay_ms();
+            if (pd > 0) {
+                struct timespec ts;
+                ts.tv_sec  = pd / 1000;
+                ts.tv_nsec = (long) (pd % 1000) * 1000000L;
+                nanosleep(&ts, nullptr);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            Slot & q = slots[(size_t) s];
+            if (q.st != Slot::PREPARING) return;   // already finished by a sweep; do not touch
+            if (poisoned || stop_flag) {
+                q.error = poisoned ? ("the batched engine was poisoned before this request " +
+                                      std::to_string(q.no) + " could start: " + poison_why)
+                                   : "the server is shutting down before this request can start";
+                q.finish = "cancelled";
+                q.st = Slot::FINISHED;
+                q.cv.notify_all();
+                return;
+            }
+            q.st = Slot::SEATED;
+            // A2: from here the WORKER writes this conn; give every write a deadline so a
+            // non-reading client cannot park the pool (see kBatchSendTimeoutMs above).
+            struct timeval tv;
+            tv.tv_sec  = kBatchSendTimeoutMs / 1000;
+            tv.tv_usec = (kBatchSendTimeoutMs % 1000) * 1000;
+            ::setsockopt(q.conn->fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        }
+        pool_cv.notify_all();
+    }
+
+    // A PREPARING slot whose SSE head write already failed: the worker never saw it.
+    void abandon(int s) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            slots[(size_t) s].st = Slot::FREE;
+        }
+        pool_cv.notify_all();
+    }
+
+    // Park until the worker finishes this slot.  On return the worker has handed the slot
+    // over and touches neither it nor the conn again.
+    // A1 belt-and-braces: publish() and the worker's poison/exit sweeps now guarantee every
+    // non-FREE slot reaches FINISHED, but a hang here costs a handler thread + a connection
+    // forever, so the wait also observes `worker_done` (set only after the worker thread has
+    // been joined, i.e. when nobody else can ever finish the slot) and finishes the slot
+    // itself — only the request thread touches a slot past that point, so this is race-free.
+    void wait_done(int s) {
+        std::unique_lock<std::mutex> lk(mu);
+        Slot & q = slots[(size_t) s];
+        q.cv.wait(lk, [&] {
+            if (q.st == Slot::FINISHED) return true;
+            if (worker_done) {
+                q.error = "the batch worker exited before this request finished";
+                q.finish = "cancelled";
+                q.st = Slot::FINISHED;
+                return true;
+            }
+            return false;
+        });
+    }
+
+    // The request thread is done reading the result; the slot is claimable again.
+    void free_slot(int s) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            slots[(size_t) s].st = Slot::FREE;
+        }
+        pool_cv.notify_all();
+    }
+
+    void shutdown_and_join() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop_flag = true;
+        }
+        pool_cv.notify_all();
+        if (worker.joinable()) worker.join();
+        {   // wake any handler that parked on a slot the exit sweep already missed
+            std::lock_guard<std::mutex> lk(mu);
+            worker_done = true;
+            for (auto & q : slots) q.cv.notify_all();
+        }
+    }
+
+    // ---- the worker ------------------------------------------------------------------------
+    // A5: EVERY departure/cancellation defers its req-<ordinal>.tokens write to
+    // pending_logs — the solo path writes the artifact on every exit including cancelled
+    // (m1_real.cpp finish_request), and the batch path now agrees; the writes are flushed
+    // OUTSIDE mu (A2: no I/O under the lock).
+    std::vector<std::pair<int, std::vector<int32_t>>> pending_logs;
+
+    void cancel_slot_locked(int s, const char * finish, const std::string & error) {
+        Slot & q = slots[(size_t) s];
+        if (q.st == Slot::FREE || q.st == Slot::FINISHED) return;
+        q.finish = finish;
+        if (!error.empty()) q.error = error;
+        q.st = Slot::FINISHED;
+        pending_logs.emplace_back(s, q.ids);   // the engine skips slots that never joined
+        q.cv.notify_all();
+    }
+
+    void poison_locked(const std::string & why) {
+        poisoned = true;
+        if (poison_why.empty()) poison_why = why;
+        for (int s = 0; s < n; ++s)
+            if (slots[(size_t) s].st != Slot::FREE && slots[(size_t) s].st != Slot::FINISHED)
+                cancel_slot_locked(s, "cancelled", why);
+    }
+
+    void depart_locked(int s, const char * finish) {
+        Slot & q = slots[(size_t) s];
+        eng->batch_depart(s);   // engine-side: the one-cell pad from the next step
+        ++departures;
+        if (srv.verbose)
+            std::fprintf(stderr,
+                         "m1_server: req %llu done (batch slot %d): prompt=%zu produced=%zu "
+                         "finish=%s\n",
+                         q.no, s, q.g.prompt.size(), q.ids.size(), finish);
+        cancel_slot_locked(s, finish, "");
+    }
+
+    // A3/A2: the one "is this client gone" predicate.  alive() is PASSIVE (it flips only
+    // after a write has failed — mid-generation a dead client is invisible to it);
+    // peer_gone() is the ACTIVE check (a RST is visible on the next peek).
+    static bool client_dead(const Slot & q) {
+        return !q.conn->alive() || q.conn->peer_gone();
+    }
+
+    // ONE sampled id's bookkeeping for slot s — runs UNDER mu, does NO I/O.  A departing
+    // slot is finished and its log deferred; a live stream slot's delta is handed back for
+    // the caller to write OUTSIDE the lock (A2).  Returns true when the request departs.
+    // This is the solo path's per-position tail (m1_real.cpp's generate loop +
+    // run_generation's sink), same order, same finish mapping: EOS is never emitted, the
+    // stop matcher owns stop-vs-length, cancellation is decided at position boundaries only.
+    bool sample_bookkeep(int s, int32_t got, std::string & delta_out) {
+        Slot & q = slots[(size_t) s];
+        if (got == eng->eos_id()) { depart_locked(s, "stop"); return true; }
+        q.ids.push_back(got);
+        std::string delta;
+        const bool matched = q.sm.push(eng->token_text(got), delta);
+        if (!delta.empty()) {
+            if (q.g.stream) delta_out = std::move(delta);   // written outside mu by the caller
+            else            q.text += delta;
+        }
+        if (client_dead(q)) {
+            q.client_gone = true;
+            depart_locked(s, "cancelled");
+            return true;
+        }
+        if (matched) { depart_locked(s, "stop"); return true; }
+        if ((long long) q.ids.size() >= q.g.max_tokens) { depart_locked(s, "length"); return true; }
+        if (m1http::stopping()) { depart_locked(s, "cancelled"); return true; }
+        q.tok_in = got;
+        return false;
+    }
+
+    void work() {
+        const int nv = eng->n_vocab();
+        std::vector<float> rows((size_t) nv * (size_t) n, 0.0f);
+        std::vector<int32_t> tok((size_t) n, 0);
+        bool livebuf[8] = {false};   // the seam takes const bool*; n <= 8
+        std::string err;
+        for (;;) {
+            int prefiller = -1;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                // ---- wait for work, applying the formation window -----------------------------
+                for (;;) {
+                    if (poisoned) break;
+                    prefiller = -1;
+                    int ndecode = 0, nseated = 0;
+                    for (int s = 0; s < n; ++s) {
+                        const Slot::St st = slots[(size_t) s].st;
+                        if (st == Slot::PREFILL) prefiller = s;
+                        else if (st == Slot::DECODE) ++ndecode;
+                        else if (st == Slot::SEATED) ++nseated;
+                    }
+                    if (prefiller >= 0 || ndecode > 0) break;   // a step is already due
+                    if (nseated > 0) {
+                        // FORMATION (plan §D): with nothing stepping, hold the first prefill up
+                        // to window_ms so a burst can share the batch.  A running batch never
+                        // waits: a request that seats mid-decode is joined at the next boundary.
+                        if (pending_since == std::chrono::steady_clock::time_point{})
+                            pending_since = std::chrono::steady_clock::now();
+                        const auto dl = pending_since + std::chrono::milliseconds(window_ms);
+                        if (window_ms > 0 && std::chrono::steady_clock::now() < dl) {
+                            pool_cv.wait_until(lk, dl);
+                            continue;
+                        }
+                        break;   // the window elapsed: the prefill starts
+                    }
+                    if (stop_flag) break;   // idle and told to stop
+                    pool_cv.wait(lk);       // idle: park until a seat, a free, or the stop
+                }
+                if (poisoned) { poison_locked(poison_why); break; }
+                bool any = prefiller >= 0;
+                for (auto & q : slots)
+                    any = any || q.st == Slot::DECODE || q.st == Slot::SEATED;
+                if (stop_flag && !any) break;
+                if (stop_flag) {   // stragglers at shutdown: no honest finish_reason exists
+                    for (int s2 = 0; s2 < n; ++s2) cancel_slot_locked(s2, "cancelled", "");
+                    break;
+                }
+                // ---- start a joiner's prefill (at most one prefill runs at a time) -------------
+                if (prefiller < 0) {
+                    int pick = -1;
+                    for (int s = 0; s < n && pick < 0; ++s)
+                        if (slots[(size_t) s].st == Slot::SEATED) pick = s;
+                    if (pick >= 0) {
+                        Slot & q = slots[(size_t) pick];
+                        uint64_t rng = 0;
+                        std::string jerr;
+                        if (!eng->batch_join(pick, (int) q.g.prompt.size(), (int) q.g.max_tokens,
+                                             q.g.sp.seed, &rng, &jerr)) {
+                            std::fprintf(stderr, "m1_server: req %llu BATCH JOIN REFUSED: %s\n",
+                                         q.no, jerr.c_str());
+                            poison_locked(jerr);
+                            break;
+                        }
+                        q.rng = rng;
+                        q.st = Slot::PREFILL;
+                        ++joins;
+                        prefiller = pick;
+                        pending_since = std::chrono::steady_clock::time_point{};
+                    }
+                }
+                // ---- compose the step: the prefiller advances ALONE, else every DECODE row ----
+                for (int s = 0; s < n; ++s) {
+                    Slot & q = slots[(size_t) s];
+                    const bool adv = prefiller >= 0 ? s == prefiller : q.st == Slot::DECODE;
+                    livebuf[s] = adv;
+                    if (adv)
+                        tok[(size_t) s] = q.st == Slot::PREFILL
+                                              ? q.g.prompt[(size_t) q.fed]
+                                              : q.tok_in;
+                }
+            }   // mu released: the step runs against slots the request threads cannot move
+
+            if (!eng->batch_step(tok.data(), livebuf, rows.data(), &err)) {
+                std::fprintf(stderr, "m1_server: BATCH STEP REFUSED: %s\n", err.c_str());
+                std::lock_guard<std::mutex> lk(mu);
+                poison_locked(err);
+                break;
+            }
+
+            // ---- post-step: BOOKKEEPING under mu, I/O outside it (A2) --------------------------
+            // A stalled stream reader can park the worker only in the write loop below —
+            // never holding mu — so claims, 503s and every other slot keep moving; the
+            // send deadline (set at publish) bounds the park and departs the stalled slot.
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                ++steps;
+                pending_since = std::chrono::steady_clock::time_point{};
+                int nadv = 0;
+                for (int s = 0; s < n; ++s)
+                    if (livebuf[s]) ++nadv;
+                live_sum += (unsigned long long) nadv;
+                struct Write { int s; std::string delta; };
+                std::vector<Write> writes;
+                for (int s = 0; s < n; ++s) {
+                    if (!livebuf[s]) continue;
+                    Slot & q = slots[(size_t) s];
+                    if (q.st == Slot::PREFILL) {
+                        ++q.fed;
+                        if (q.fed == (int) q.g.prompt.size()) {
+                            // position n_prompt-1's row: the FIRST sampled id (the solo decode's
+                            // entry position, m1_real.cpp's mapping)
+                            const int32_t got = m1_sample_row(rows.data() + (size_t) s * (size_t) nv,
+                                                              nv, q.g.sp, q.rng);
+                            std::string delta;
+                            if (!sample_bookkeep(s, got, delta)) q.st = Slot::DECODE;   // joins
+                            if (!delta.empty()) writes.push_back({ s, std::move(delta) });
+                        } else if (client_dead(q) || m1http::stopping()) {
+                            // A3: a joiner whose client is gone (or a shutdown) leaves at the
+                            // NEXT position boundary — the solo path checks every prefill
+                            // position (m1_real.cpp's cancel between steps), and the batch no
+                            // longer freezes the whole engine behind a dead client for the
+                            // rest of its prompt.  Safe engine-side: the slot has advanced
+                            // (last_pos >= 0), so depart's pad lands in its own region.
+                            q.client_gone = q.client_gone || client_dead(q);
+                            depart_locked(s, "cancelled");
+                        }
+                    } else if (q.st == Slot::DECODE) {
+                        const int32_t got = m1_sample_row(rows.data() + (size_t) s * (size_t) nv,
+                                                          nv, q.g.sp, q.rng);
+                        std::string delta;
+                        sample_bookkeep(s, got, delta);
+                        if (!delta.empty()) writes.push_back({ s, std::move(delta) });
+                    }
+                }
+                auto logs = std::move(pending_logs);
+                pending_logs.clear();
+                lk.unlock();
+
+                // the worker is the ONLY conn writer between publish and FINISHED, so these
+                // unlocked writes race nothing; a slot that departed WITH a pending delta
+                // (stop string, length) still gets its final content — the request thread's
+                // tail runs only after the FINISHED handoff.
+                std::vector<int> write_failed;
+                for (const Write & w : writes) {
+                    const Slot & q = slots[(size_t) w.s];
+                    if (!sse_content_chunk(*q.conn, q.rid, q.created, srv.model_name, q.g.chat,
+                                           w.delta))
+                        write_failed.push_back(w.s);
+                }
+                for (const auto & lg : logs) eng->batch_log(lg.first, lg.second);
+
+                if (!write_failed.empty()) {
+                    std::unique_lock<std::mutex> lk2(mu);
+                    for (int s : write_failed) {
+                        Slot & q = slots[(size_t) s];
+                        if (q.st == Slot::FINISHED) continue;   // already departed another way
+                        q.client_gone = true;
+                        depart_locked(s, "cancelled");
+                    }
+                    auto logs2 = std::move(pending_logs);
+                    pending_logs.clear();
+                    lk2.unlock();
+                    for (const auto & lg : logs2) eng->batch_log(lg.first, lg.second);
+                }
+            }
+        }
+        // exit: wake everything the loop left behind (a seat racing the stop flag), flush
+        // the deferred request logs (A5: the artifact is written on every exit, including
+        // cancels — solo-path parity), then print the observation line.
+        std::vector<std::pair<int, std::vector<int32_t>>> logs;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            for (int s2 = 0; s2 < n; ++s2) cancel_slot_locked(s2, "cancelled", "");
+            logs = std::move(pending_logs);
+            pending_logs.clear();
+        }
+        for (const auto & lg : logs) eng->batch_log(lg.first, lg.second);
+        std::printf("# batch assembler shutdown: steps=%llu mean-live-slots=%.2f joins=%llu "
+                    "departures=%llu (an OBSERVATION on this boot, not a product number)\n",
+                    steps, steps ? (double) live_sum / (double) steps : 0.0, joins, departures);
+        std::fflush(stdout);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// B3 — the batched generation driver: claim → (SSE head) → publish → park while the worker
+// walks the slot → the SAME tail run_generation runs (stop flush, finish decision, usage,
+// the wire shapes).  The engine interaction is entirely the worker's; this thread touches
+// the conn only before publish (the SSE head) and after the wake (the tail).
+// ---------------------------------------------------------------------------
+static void run_batch_generation(Server & srv, m1http::Conn & c, const m1http::Request & rq,
+                                 unsigned long long no, GenRequest & g, bool debug_route) {
+    BatchPool & pool = *srv.pool;
+    const int s = pool.claim(g, c, no, debug_route);
+    if (s == -1) {
+        send_engine_busy(c, srv.batch_slots);   // the SAME 503 shape, the slots named
+        return;
+    }
+    if (s < 0) {
+        // poisoned (or shutting down): the same 500 the single-flight path answers its entry
+        // invariant with — the engine cannot honestly serve this request.
+        ApiError e;
+        e.status  = 500;
+        e.type    = "server_error";
+        e.message = "the batched engine is not servable (a batch step was refused, or the server "
+                    "is shutting down); the engine is unusable until the server is restarted";
+        e.code    = "engine_state_dirty";
+        {
+            std::lock_guard<std::mutex> lk(pool.mu);
+            if (!pool.poison_why.empty()) e.message += ": " + pool.poison_why;
+        }
+        send_api_error(c, e);
+        return;
+    }
+    BatchPool::Slot & q = pool.slot(s);
+    if (g.stream) {
+        if (!c.head(200, "text/event-stream",
+                    "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n", -1)) {
+            pool.abandon(s);
+            return;
+        }
+        // the FIRST chunk carries delta.role (plan §F), written here so the worker's first
+        // content chunk can never race it
+        if (!sse_role_chunk(c, q.rid, q.created, srv.model_name, g.chat)) {
+            pool.abandon(s);
+            return;
+        }
+    }
+    pool.publish(s);
+    pool.wait_done(s);
+
+    // ---- the tail: run_generation's, reading the slot's result ------------------------------
+    if (!q.error.empty()) {
+        std::fprintf(stderr, "m1_server: req %llu ENGINE REFUSED: %s\n", no, q.error.c_str());
+        if (!g.stream) {
+            ApiError e;
+            e.status  = 500;
+            e.type    = "server_error";
+            e.message = "the engine refused to generate this request: " + q.error;
+            e.code    = "engine_refused";
+            send_api_error(c, e);
+        }
+        pool.free_slot(s);
+        return;
+    }
+    std::string tail;
+    bool dropped_partial = false;
+    q.sm.finish(tail, &dropped_partial);
+    if (!tail.empty()) {
+        if (g.stream) {
+            if (!sse_content_chunk(c, q.rid, q.created, srv.model_name, g.chat, tail)) {
+                pool.free_slot(s);
+                return;
+            }
+        } else {
+            q.text += tail;
+        }
+    }
+    if (dropped_partial)
+        std::fprintf(stderr, "m1_server: req %llu: dropped a trailing partial UTF-8 sequence\n", no);
+    if (q.client_gone || !c.alive()) {   // the client vanished mid-stream (plan §G2)
+        pool.free_slot(s);
+        return;
+    }
+    const char * finish = "length";
+    {
+        GenResult res;   // decide_finish reads exactly {finish}; the ids stay the slot's
+        res.finish = q.finish;
+        if (!decide_finish(q.sm, res, &finish)) {   // shutdown: no honest finish_reason exists
+            pool.free_slot(s);
+            return;
+        }
+    }
+    const long long n_prompt = (long long) g.prompt.size();
+    const long long n_completion = (long long) q.ids.size();
+
+    if (debug_route) {
+        std::string b = "{\"object\":\"debug.tokens\",\"ids\":[";
+        for (size_t k = 0; k < q.ids.size(); ++k) {
+            if (k) b += ",";
+            m1json::append_int(b, q.ids[k]);
+        }
+        b += "],\"text\":";
+        m1json::append_string(b, q.text);
+        b += ",\"finish_reason\":";
+        m1json::append_string(b, finish);
+        b += ",\"usage\":";
+        append_usage(b, n_prompt, n_completion);
+        b += "}";
+        send_json(c, 200, b);
+        log_done(srv, no, rq, finish, n_prompt, n_completion, false);
+        pool.free_slot(s);
+        return;
+    }
+
+    if (g.stream) {
+        if (!sse_final_chunk(c, q.rid, q.created, srv.model_name, g.chat, finish)) {
+            pool.free_slot(s);
+            return;
+        }
+        if (g.include_usage) {
+            if (!sse_usage_chunk(c, q.rid, q.created, srv.model_name, g.chat, n_prompt,
+                                 n_completion)) {
+                pool.free_slot(s);
+                return;
+            }
+        }
+        sse_done(c);
+        log_done(srv, no, rq, finish, n_prompt, n_completion, true);
+        pool.free_slot(s);
+        return;
+    }
+
+    std::string b = "{\"id\":";
+    m1json::append_string(b, q.rid);
+    b += ",\"object\":";
+    b += g.chat ? "\"chat.completion\"" : "\"text_completion\"";
+    b += ",\"created\":";
+    m1json::append_int(b, q.created);
+    b += ",\"model\":";
+    m1json::append_string(b, srv.model_name);
+    b += ",\"choices\":[{\"index\":0,";
+    if (g.chat) {
+        b += "\"message\":{\"role\":\"assistant\",\"content\":";
+        m1json::append_string(b, q.text);
+        b += "},\"finish_reason\":";
+    } else {
+        b += "\"text\":";
+        m1json::append_string(b, q.text);
+        b += ",\"logprobs\":null,\"finish_reason\":";
+    }
+    m1json::append_string(b, finish);
+    b += "}],\"usage\":";
+    append_usage(b, n_prompt, n_completion);
+    b += "}";
+    send_json(c, 200, b);
+    log_done(srv, no, rq, finish, n_prompt, n_completion, false);
+    pool.free_slot(s);
+}
+
 // ---------------------------------------------------------------------------
 // route: POST /v1/chat/completions
 // ---------------------------------------------------------------------------
@@ -1092,7 +1930,7 @@ static void do_chat(Server & srv, m1http::Conn & c, const m1http::Request & rq,
         return;
     }
     g.prompt = std::move(prompt);
-    if (!apply_budget(srv.engine, g, err)) {
+    if (srv.pool ? !apply_budget_slot(srv, g, err) : !apply_budget(srv.engine, g, err)) {
         send_api_error(c, err);
         return;
     }
@@ -1143,7 +1981,7 @@ static void do_completions(Server & srv, m1http::Conn & c, const m1http::Request
         return;
     }
     g.prompt = srv.engine->encode(p->str);
-    if (!apply_budget(srv.engine, g, err)) {
+    if (srv.pool ? !apply_budget_slot(srv, g, err) : !apply_budget(srv.engine, g, err)) {
         send_api_error(c, err);
         return;
     }
@@ -1215,6 +2053,16 @@ static void do_debug_tokens(Server & srv, m1http::Conn & c, const m1http::Reques
         }
         g.prompt.push_back((int32_t) id);
     }
+    if (srv.pool) {
+        // B3: the same budget against the slot's REGION, then the assembler.  This route is
+        // the id-parity seam, so it rides the batched engine exactly like the OpenAI routes.
+        if (!apply_budget_slot(srv, g, err)) {
+            send_api_error(c, err);
+            return;
+        }
+        run_batch_generation(srv, c, rq, no, g, /*debug_route=*/true);
+        return;
+    }
     if (!apply_budget(srv.engine, g, err)) {
         send_api_error(c, err);
         return;
@@ -1225,13 +2073,7 @@ static void do_debug_tokens(Server & srv, m1http::Conn & c, const m1http::Reques
                    ? lock.try_lock()
                    : lock.try_lock_for(std::chrono::milliseconds(srv.queue_wait_ms));
     if (!got) {
-        ApiError e;
-        e.status  = 503;
-        e.type    = "server_error";
-        e.message = "engine busy: another request holds the single-flight engine; retry after 1s";
-        e.code    = "engine_busy";
-        e.headers = "Retry-After: 1\r\n";
-        send_api_error(c, e);
+        send_engine_busy(c, 0);
         return;
     }
 
@@ -1402,7 +2244,22 @@ static void usage(const char * argv0) {
         "  --bind ADDR            bind address [127.0.0.1]\n"
         "  --max-conns N          in-flight connection cap, over-cap => 503 + Retry-After [32]\n"
         "  --queue-wait-ms N      how long a second request waits for the single-flight engine\n"
-        "                         before 503 [30000]\n"
+        "                         before 503 [30000].  At --batch-slots > 1 this does not apply:\n"
+        "                         seating is bounded by --batch-window-ms instead\n"
+        "  --batch-slots N        N > 1 turns the single-flight engine into an N-slot batch\n"
+        "                         assembler (plan §D): one engine step advances every live request\n"
+        "                         by one position of its own sequence, over fixed per-slot KV\n"
+        "                         regions of kv_max/N cells.  A joiner PREFILLS ALONE (the batch\n"
+        "                         pauses), then joins; a departed slot is padded.  At N >= 2 a\n"
+        "                         batched answer is EXPECTED to differ from the single-flight\n"
+        "                         answer for the same request (F16/F32 GEMM dispatch at M=N,\n"
+        "                         LEDGER L90/L91) — gated by quality (L92), never id equality;\n"
+        "                         the fused m4_* kernels are nt==1 and the batch runs STOCK.\n"
+        "                         REFUSES --rotate (rotation under a batch is B4's unit) and\n"
+        "                         kv_max/slots must be a multiple of 16.  [1 = single flight]\n"
+        "  --batch-window-ms N    the assembler's deadline: how long an EMPTY pool holds the\n"
+        "                         first prefill waiting for company (formation), and how long a\n"
+        "                         request waits for a free slot before the engine_busy 503. [10]\n"
         "  --model-name NAME      the ONE served model id, everything else 404s [mistral-small-4]\n"
         "  --model PATH           the GGUF path [the pinned Mistral Small 4 file]\n"
         "  --engine fake|real     engine implementation [fake] (real needs -DM1_ENGINE_REAL,\n"
@@ -1535,6 +2392,8 @@ int main(int argc, char ** argv) {
         else if (a == "--bind" && has_next) bind_addr = argv[++i];
         else if (a == "--max-conns" && has_next) max_conns = std::atoi(argv[++i]);
         else if (a == "--queue-wait-ms" && has_next) srv.queue_wait_ms = std::atoi(argv[++i]);
+        else if (a == "--batch-slots" && has_next) srv.batch_slots = std::atoi(argv[++i]);
+        else if (a == "--batch-window-ms" && has_next) srv.batch_window_ms = std::atoi(argv[++i]);
         else if (a == "--model-name" && has_next) srv.model_name = argv[++i];
         else if (a == "--model" && has_next) ecfg.model_path = argv[++i];
         else if (a == "--engine" && has_next) real_engine = (std::strcmp(argv[++i], "real") == 0);
@@ -1584,6 +2443,32 @@ int main(int argc, char ** argv) {
     CHECK(ecfg.n_res >= 1, "--n-res must be >= 1");
     CHECK(lock_wait_ms >= 0, "--lock-wait-ms must be >= 0");
     CHECK(!srv.model_name.empty(), "--model-name must not be empty");
+    // ---- B3: the assembler's configuration contract, refused at STARTUP with both flags
+    // named — never a silent downgrade (the U4 lesson: a silent fallback presents as a
+    // performance result that is not one).
+    CHECK(srv.batch_slots >= 1 && srv.batch_slots <= 8,
+          "--batch-slots %d is out of range [1,8] (the session's batch width cap, "
+          "m1_engine.cpp open)", srv.batch_slots);
+    CHECK(srv.batch_window_ms >= 0, "--batch-window-ms must be >= 0 (0 = no formation wait, "
+          "no seating wait)");
+    if (srv.batch_slots > 1) {
+        CHECK(!ecfg.rotate,
+              "--batch-slots %d REFUSES --rotate: rotation over the batch's union is B4's unit "
+              "(the union-driven membership changes the store split's float accumulation, so "
+              "per-sequence equality is dead by construction, plan §C) — drop --rotate or run "
+              "--batch-slots 1", srv.batch_slots);
+        CHECK(ecfg.kv_max % srv.batch_slots == 0,
+              "--kv-max %d is not divisible by --batch-slots %d (the per-slot KV region is a "
+              "FIXED contiguous block of kv_max/slots cells, plan §A option ii)",
+              ecfg.kv_max, srv.batch_slots);
+        CHECK((ecfg.kv_max / srv.batch_slots) % 16 == 0,
+              "--kv-max %d / --batch-slots %d = %d cells per slot is not a multiple of 16: "
+              "region bases must stay 16-cell aligned — B2FIX MEASURED that a 1-cell region "
+              "translation is NOT bit-inert on the kq/kqv lane-blocked reductions while "
+              "16-cell steps are inert", ecfg.kv_max, srv.batch_slots,
+              ecfg.kv_max / srv.batch_slots);
+    }
+    ecfg.batch_slots = srv.batch_slots;
 
 #ifdef M1_ENGINE_REAL
     // THE BOOT LOCK, before the engine touches the card: the fd is held for the process's lifetime
@@ -1611,9 +2496,25 @@ int main(int argc, char ** argv) {
         std::printf("m1_server: FAKE engine — CPU-only, no ggml, no GPU, and it does NOT take "
                     "scripts/gpu.lock (the wire protocol is what is under test)\n");
     }
+    if (srv.batch_slots > 1) {
+        // B3: build the assembler and start its worker BEFORE the first request can arrive.
+        // The engine behind it is already N wide (its own boot line says so).
+        srv.pool = new BatchPool(srv, srv.batch_window_ms);
+        srv.pool->start();
+        std::printf("m1_server: batch assembler ON: slots=%d window_ms=%d region=%d cells/slot "
+                    "(kv_max %d / %d) — a new request PREFILLS ALONE (the batch pauses) and "
+                    "joins at the next position boundary; a departed slot is padded; "
+                    "rotation OFF (B4 owns it); --reset is inert here\n",
+                    srv.batch_slots, srv.batch_window_ms, srv.engine->batch_slot_cap(),
+                    srv.engine->kv_max(), srv.batch_slots);
+    }
     if (const char * mut = std::getenv("M1_SERVER_MUTANT")) {
         std::printf("m1_server: *** TEST MUTANT ACTIVE: M1_SERVER_MUTANT=%s ***\n", mut);
     }
+    if (const char * m1 = std::getenv("M1_BATCH_POISON_STEP"))
+        std::printf("m1_server: *** TEST HOOK ACTIVE: M1_BATCH_POISON_STEP=%s ***\n", m1);
+    if (const char * m2 = std::getenv("M1_BATCH_PUBLISH_DELAY_MS"))
+        std::printf("m1_server: *** TEST HOOK ACTIVE: M1_BATCH_PUBLISH_DELAY_MS=%s ***\n", m2);
     std::fflush(stdout);
 
     m1http::Config hc;
@@ -1639,6 +2540,10 @@ int main(int argc, char ** argv) {
     const int rc = m1http::serve(hc, [&srv](const m1http::Request & rq, m1http::Conn & c) {
         handle_request(srv, rq, c);
     }, nullptr);
+    // B3: stop the assembler's worker (it cancels any parked request at a position boundary)
+    // before the process unwinds.  DELIBERATELY NOT `delete srv.pool`, for the same reason as
+    // the engine below: a handler that outlived the drain window would touch freed state.
+    if (srv.pool) srv.pool->shutdown_and_join();
     std::printf("m1_server: shut down cleanly after %llu requests\n",
                 (unsigned long long) srv.requests.load());
     // DELIBERATELY NOT `delete srv.engine` (U5FIX finding 4). m1http::serve() waits at most --drain-ms

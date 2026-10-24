@@ -159,6 +159,16 @@ struct EngineCfg {
     std::string request_log;           // --request-log DIR: req-<n>.tokens (the m1 file format)
     int         chat_bos   = 0;        // --chat-bos: M1_CHAT_BOS_TEMPLATE (0) | _TOKENIZER (1)
     bool        verbose    = false;    // --verbose: the per-request engine log lines
+    // ---- B3 — THE BATCH ASSEMBLER's width (plan §D) ----
+    // 1 (the default) is TODAY'S SERVER EXACTLY: the single-flight mutex, the scalar generate()
+    // path, byte for byte — nothing batched is built or called.  N > 1 opens the session N wide
+    // (LoopArgs::batch_nt) and the server drives it through the batch_* seam below: one engine
+    // step advances every live slot by one position of its own sequence.  The m4_* fused kernels
+    // are nt==1-gated, so N > 1 runs the STOCK op sequence; and the F16/F32 GEMMs dispatch
+    // differently at M=N than at M=1 (L90/L91), so a batched answer is EXPECTED to differ from
+    // the single-flight answer for the same request at N >= 2 — gated by quality (L92), never by
+    // id equality.  --rotate is REFUSED at N > 1 (rotation under a batch is B4's unit).
+    int         batch_slots = 1;
 };
 
 // A chat message exactly as the HTTP layer hands it over (the engine owns the render).
@@ -212,4 +222,53 @@ struct M1Engine {
     virtual GenResult generate(const std::vector<int32_t> & prompt, int max_tokens,
                                const Sampling & sp, const TokenSink & sink,
                                const CancelFn & cancel) = 0;
+
+    // -----------------------------------------------------------------------
+    // B3 — THE BATCHED SEAM (batch plan §D; --batch-slots N > 1).  The ASSEMBLER
+    // (m1_server.cpp's BatchPool) owns per-REQUEST state (stop strings, sampling,
+    // SSE writing, usage, cancellation); the ENGINE owns per-SLOT sequence
+    // mechanics: the fixed region arithmetic (base_s = s * kv_max/N, capacity
+    // kv_max/N), the per-slot position counters, and the PAD discipline — a slot
+    // that is not advancing is padded INSIDE ITS OWN REGION with ONE live mask
+    // cell (an all-masked row is a NaN trap through exp(-inf - (-inf)), L90), and
+    // a frozen-but-joined slot is an IDEMPOTENT REPLAY of its last fed position
+    // (same token, same position, same window: the KV write lands on the same
+    // cell with the same bytes, so a waiting slot's state cannot move).  This is
+    // the B2 rig's exact discipline, moved to the engine so the assembler cannot
+    // get it wrong per engine.  BOTH engines implement it — the fake's minimal
+    // batch mode is what makes the scheduling gateable without a GPU (plan §H).
+    // At batch_slots == 1 none of these are ever called.
+    // -----------------------------------------------------------------------
+    // The configured slot count (== EngineCfg::batch_slots).
+    virtual int  n_batch_slots() const = 0;
+    // The per-slot region capacity (kv_max / N), the budget the router enforces.
+    virtual int  batch_slot_cap() const = 0;
+    // Start slot `slot` for a NEW sequence of n_prompt + max_tokens positions
+    // (the ROUTER's budget arithmetic, re-checked here because "unreachable" must
+    // fail loudly): resets the slot's per-sequence state, mints its per-request
+    // RNG stream into *rng (plan §E: per-request, never shared), and assigns the
+    // request-log ordinal.  false + *err on a bad slot index or an over-budget
+    // walk — BEFORE any engine step.
+    virtual bool batch_join(int slot, int n_prompt, int max_tokens, uint64_t req_seed,
+                            uint64_t * rng, std::string * err) = 0;
+    // ONE engine step at the session's fixed width.  live[t]: slot t advances
+    // this step, feeding tok[t] at ITS OWN next position (its window is its
+    // whole walked prefix inside its region); !live[t]: the engine pads row t as
+    // above.  rows receives n_slots * n_vocab floats (row t = slot t); a padded
+    // row's contents are UNSPECIFIED.  At most ONE slot advances while it is
+    // still walking its prompt (a joiner prefills alone, plan §B) — the engine
+    // does not enforce this, the assembler owns it.  false + *err = the session
+    // refused the step (assembler bug): the engine is then POISONED — every
+    // batched caller must be failed loudly, never served through.
+    virtual bool batch_step(const int32_t * tok, const bool * live, float * rows,
+                            std::string * err) = 0;
+    // The seated sequence departs (EOS / stop / length / cancel / client gone):
+    // from the next step the slot is a one-cell pad at its own last live cell,
+    // and the region is claimable by a later joiner, which rewrites every cell
+    // it attends (stale cells are unreadable by construction).
+    virtual void batch_depart(int slot) = 0;
+    // The departing request's artifact: req-<ordinal>.tokens in the m1 file
+    // format, written once, at departure (the solo path's finish_request writes
+    // the same bytes at the same point in its lifecycle).
+    virtual void batch_log(int slot, const std::vector<int32_t> & ids) = 0;
 };

@@ -20,12 +20,14 @@
 // PER-REQUEST STATE (plan §E). What must be reset: the position counter (this file's `pos`) and,
 // with --reset=exact (the default), the rotation's VRAM membership + 2Q policy, replayed back to
 // the boot permutation by m1_session_reset_rotation(). What must NOT be reset: the KV cache —
-// forward() writes cell pos and set_input masks EVERY cell >= the live length with -INFINITY
-// (engine/m1_layer.cpp:747-751, the async twin :767-775), and both attention expressions consume
-// that mask (m4_kqkv :475, soft_max_ext :492), so at position p the layers attend exactly cells
-// 0..p, all written by THIS request. A stale cell is unreadable by construction. The reset-parity
-// arm of scripts/engine_gate_server.sh is what proves the rest of the claim: it would fail if the
-// KV, the rotation or any other engine state leaked between requests.
+// forward() writes cell kidx = kv_base + pos and set_input masks every cell OUTSIDE the row's live
+// window [kv_base, kv_base + nkv) with -INFINITY (engine/m1_layer.cpp's set_input, the async twin
+// below it; B1 made the window a (base, len) pair, and the session passes base = 0), and both
+// attention expressions consume that mask (m4_kqkv :475, soft_max_ext :492), so at position p the
+// layers attend exactly cells 0..p, all written by THIS request. A stale cell is unreadable by
+// construction. The reset-parity arm of scripts/engine_gate_server.sh is what proves the rest of
+// the claim: it would fail if the KV, the rotation or any other engine state leaked between
+// requests.
 //
 // EVERY CLIENT-CAUSED FAILURE IS PRE-CHECKED IN THE ROUTER, NOT HERE (plan §G3/R7): the engine's
 // invariant violations are FATALs that kill the process, so n_prompt >= kv_max, an out-of-vocab id,
@@ -144,6 +146,11 @@ struct RealEngine : M1Engine {
         args.rot_admit_k_set = cfg.rotate;   // the server names the policy explicitly, so
                                              // --rotate's "needs --rotate" refusal reads an
                                              // honest flag; without --rotate it must stay unset
+        // B3: the batched session width.  The server's main() has already refused
+        // --rotate/--fold with --batch-slots > 1 by name; open() re-refuses both (plus the
+        // kv_max % nt split) at its own boundary, so no caller can sneak a rotating batched
+        // session past the one place the engine is built.
+        args.batch_nt   = cfg.batch_slots;
         args.rotate_verify = cfg.rotate_verify;
         args.res_path   = cfg.res_path;
         if (!cfg.res_path.empty()) {
@@ -211,6 +218,7 @@ struct RealEngine : M1Engine {
                                                          : "tokenizer (llama-server's double BOS)",
                     cfg.request_log.empty() ? "(off)" : cfg.request_log.c_str());
         std::printf("# tokenizer = %s\n", tok->summary().c_str());
+        boot_batch();
         if (mutant_skip_reset())
             std::printf("m1_server: *** TEST MUTANT ACTIVE: M1_SERVER_MUTANT=skip_reset — the "
                         "per-request reset is SKIPPED and the entry invariant must refuse the next "
@@ -456,6 +464,186 @@ struct RealEngine : M1Engine {
         if (!r.error.empty())
             std::fprintf(stderr, "m1_server: req %lld ENGINE REFUSED: %s\n", ordinal, r.error.c_str());
         ++ordinal;
+    }
+
+    // =======================================================================
+    // B3 — THE BATCHED SEAM (m1_engine_api.h).  Per-SLOT sequence mechanics only:
+    // region arithmetic, position counters, the pad/replay discipline.  Everything
+    // per-REQUEST (sampling, stop strings, streaming, usage) is the assembler's.
+    //
+    // THE ROW COMPOSITION (the B2 rig's discipline, verbatim — tools/m1_batch_test.cpp's
+    // step_rows, whose bars are the fixed-width identity proofs of L90):
+    //   advancing  : (tok, pos, base, pos+1)          — its own next position, its walked prefix
+    //   frozen LIVE: (last_tok, last_pos, base, last_pos+1) — the IDEMPOTENT REPLAY: same
+    //                (tok, pos, window) rewrites the same KV cell with the same bytes, so a
+    //                waiting slot's state cannot move while a joiner prefills alone
+    //   UNJOINED   : (any valid id, 0, base, 1)       — one-cell pad at base+0, rewritten by
+    //                its own prefill position 0 before anything reads it
+    //   DEPARTED   : (last_tok, 0, done_cell, 1)      — one-cell pad at its own last live
+    //                cell; garbage confined to its own region
+    // An all-masked row is REFUSED by the session (a NaN trap through exp(-inf - (-inf)),
+    // measured 512/512 cells, L90) — a pad always keeps its one live cell.
+    // =======================================================================
+    struct BSlot {
+        enum St { UNJ, LIVE, GONE };
+        St      st = UNJ;
+        bool    joined = false;     // batch_join ran (the ordinal is valid; depart/log may run)
+        int     pos = 0;           // the next position a LIVE row feeds (0 == fresh)
+        int32_t last_tok = 0;      // the last FED token (the frozen replay's token)
+        int     last_pos = -1;     // its position; -1 = never advanced
+        int64_t base = 0;          // s * (kv_max / N)
+        int64_t done_cell = 0;     // GONE's pad cell (its own last live cell)
+        int32_t done_tok = 0;
+        long long ordinal = 0;     // the request-log ordinal minted at join
+    };
+    int                 b_n = 1;
+    std::vector<BSlot>  bslots;
+    std::vector<int32_t> b_toks;   // the composed rows, reused per step
+    std::vector<int>     b_pos;
+    std::vector<int64_t> b_base, b_len;
+    bool                b_poisoned = false;
+
+    void boot_batch() {
+        b_n = cfg.batch_slots;
+        if (b_n <= 1) return;
+        const int kv = m1_session_kv_max(sess);
+        bslots.assign((size_t) b_n, BSlot());
+        for (int s = 0; s < b_n; ++s)
+            bslots[(size_t) s].base = (int64_t) s * (kv / b_n);
+        b_toks.assign((size_t) b_n, 0);
+        b_pos.assign((size_t) b_n, 0);
+        b_base.assign((size_t) b_n, 0);
+        b_len.assign((size_t) b_n, 0);
+        std::printf("m1_server: batched engine: %d slot(s), region %d cells each (kv_max %d / %d), "
+                    "rotation OFF (plan §C: B4 owns rotation under a batch)\n",
+                    b_n, kv / b_n, kv, b_n);
+    }
+
+    int n_batch_slots() const override { return b_n; }
+    int batch_slot_cap() const override {
+        return b_n <= 1 ? m1_session_kv_max(sess) : m1_session_kv_max(sess) / b_n;
+    }
+
+    bool batch_join(int slot, int n_prompt, int max_tokens, uint64_t req_seed,
+                    uint64_t * rng, std::string * err) override {
+        if (b_poisoned) { if (err) *err = "the batched engine is poisoned (a previous step was refused)"; return false; }
+        if (slot < 0 || slot >= b_n) {
+            if (err) *err = "batch_join: slot " + std::to_string(slot) + " out of range [0," +
+                            std::to_string(b_n) + ")";
+            return false;
+        }
+        const long long cap = batch_slot_cap();
+        if ((long long) n_prompt + max_tokens > cap) {
+            // The router's per-slot budget makes this unreachable; it is here because
+            // "unreachable" must fail loudly (and with a better message than a mid-walk
+            // step refusal would give).
+            if (err) *err = "batch_join: prompt " + std::to_string(n_prompt) + " + max_tokens " +
+                            std::to_string(max_tokens) + " exceeds the per-slot region " +
+                            std::to_string(cap) + " — the router's clamp should have prevented this";
+            return false;
+        }
+        BSlot & b = bslots[(size_t) slot];
+        b.st = BSlot::UNJ;
+        b.joined = true;
+        b.pos = 0;
+        b.last_pos = -1;
+        b.ordinal = ordinal++;   // the stream and the request log share one ordinal per request,
+                                 // exactly as the solo path's generate() does
+        if (rng) *rng = m1_request_rng(cfg.seed, req_seed, b.ordinal);
+        return true;
+    }
+
+    bool batch_step(const int32_t * tok, const bool * live, float * rows,
+                    std::string * err) override {
+        if (b_poisoned) { if (err) *err = "the batched engine is poisoned (a previous step was refused)"; return false; }
+        for (int t = 0; t < b_n; ++t) {
+            BSlot & b = bslots[(size_t) t];
+            if (live[t]) {
+                b_toks[(size_t) t] = tok[t];
+                b_pos[(size_t) t]  = b.pos;
+                b_base[(size_t) t] = b.base;
+                b_len[(size_t) t]  = (int64_t) b.pos + 1;   // the walked prefix
+                b.last_tok = tok[t];
+                b.last_pos = b.pos;
+                ++b.pos;
+                b.st = BSlot::LIVE;
+            } else if (b.st == BSlot::LIVE) {
+                if (b.last_pos < 0) {
+                    if (err) *err = "batch_step: slot " + std::to_string(t) + " is frozen before it "
+                                    "ever advanced (an assembler bug)";
+                    b_poisoned = true;
+                    return false;
+                }
+                b_toks[(size_t) t] = b.last_tok;
+                b_pos[(size_t) t]  = b.last_pos;
+                b_base[(size_t) t] = b.base;
+                b_len[(size_t) t]  = (int64_t) b.last_pos + 1;
+            } else if (b.st == BSlot::UNJ) {
+                // any valid id: the row's output is discarded and the cell is rewritten by this
+                // slot's own prefill position 0 before any read (the rig's ST_UNJOINED pad)
+                b_toks[(size_t) t] = this->tok->id_bos;   // `tok` is the parameter here
+                b_pos[(size_t) t]  = 0;
+                b_base[(size_t) t] = b.base;
+                b_len[(size_t) t]  = 1;
+            } else {   // GONE
+                b_toks[(size_t) t] = b.done_tok;
+                b_pos[(size_t) t]  = 0;            // kidx = done_cell + 0
+                b_base[(size_t) t] = b.done_cell;
+                b_len[(size_t) t]  = 1;
+            }
+        }
+        if (!m1_session_step_batch(sess, b_n, b_toks.data(), b_pos.data(), b_base.data(),
+                                   b_len.data(), rows)) {
+            // The session refused BEFORE any partial step (its per-row checks run first), but the
+            // assembler has lost synchronisation with the walk — nothing served through this
+            // engine can be honest.  Poison it; every batched caller must be failed loudly.
+            b_poisoned = true;
+            if (err) *err = "m1_session_step_batch refused the composed batch (see the FAIL line "
+                            "on stderr) — the batched engine is poisoned";
+            return false;
+        }
+        return true;
+    }
+
+    // B3FIX A4: a departure BEFORE the slot's first advance would compute done_cell =
+    // base - 1 — at slot 0 that is cell -1 (the session refuses, the engine poisons: a
+    // whole-engine kill for one request), and at slot s > 0 it is the LAST CELL OF THE
+    // NEIGHBOUR REGION, which PASSES the session's global-window checks and silently pads a
+    // live neighbour.  Unreachable from today's assembler (every depart is inside the
+    // post-step bookkeeping, i.e. after >= 1 advance), but the seam's contract lists
+    // cancel/client-gone as departure causes without excluding never-advanced slots — so the
+    // engine takes the SAFE arm itself: pad such a slot at its OWN base+0 (identical to its
+    // never-joined pad cell, provably inside its region) instead of refusing.
+    void batch_depart(int slot) override {
+        if (slot < 0 || slot >= b_n) {
+            std::fprintf(stderr, "m1_server: batch_depart: slot %d out of range [0,%d) — ignored\n",
+                         slot, b_n);
+            return;
+        }
+        BSlot & b = bslots[(size_t) slot];
+        if (b.last_pos < 0) {
+            b.done_cell = b.base;        // its own first cell: the UNJ pad, never the neighbour
+            b.done_tok  = this->tok->id_bos;
+        } else {
+            b.done_cell = b.base + b.last_pos;   // its own last live cell
+            b.done_tok  = b.last_tok;
+        }
+        b.st = BSlot::GONE;
+    }
+
+    void batch_log(int slot, const std::vector<int32_t> & ids) override {
+        if (slot < 0 || slot >= b_n) {
+            std::fprintf(stderr, "m1_server: batch_log: slot %d out of range [0,%d) — ignored\n",
+                         slot, b_n);
+            return;
+        }
+        // A5: the assembler defers EVERY exit's log here, including cancels of slots that
+        // never joined (poison sweeps, the exit sweep) — only a JOINED slot has an ordinal,
+        // and logging an unjoined slot would overwrite req-0 with empty ids.
+        if (!bslots[(size_t) slot].joined) return;
+        if (!cfg.request_log.empty())
+            write_tokens_file(cfg.request_log + "/req-" + std::to_string(bslots[(size_t) slot].ordinal) +
+                              ".tokens", ids);
     }
 };
 

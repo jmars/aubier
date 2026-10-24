@@ -10,7 +10,8 @@
 //   src/llama-fork/ggml/src/ggml-cpu/ops.cpp     ggml_rope_yarn_corr_dims / rope_yarn
 //
 // The ONE deliberate deviation from the reference, and it is named: this file allocates the cache
-// at n_kv_max and masks the not-yet-written cells with -INFINITY, while the reference builds its
+// at n_kv_max and masks every cell OUTSIDE each row's live window [base, base+len) with -INFINITY
+// (B1: the window is a (base, len) pair — at N = 1 base is 0), while the reference builds its
 // mask at the KV cache's PADDED cell count.  That padding is NOT "the current position + 1" on
 // this fork and it is not a function of any flag: get_n_kv() pads by max(n_pad = 1, 256) — the
 // PR-16812 graph-reuse padding, llama-kv-cache.cpp:1283-1290 — so the reference's mask width is a
@@ -520,7 +521,14 @@ void M1Layer::build(GGUFModel & m, int layer_, ggml_backend_t backend,
     // router — build_moe_ffn (gating softmax, top-4, norm_w, w_scale 1.0, no exp_probs_b)
     g_logits = ggml_mul_mat(ctx, w[LW_GATE_INP], g_cur);                       // [128, nt]
     g_probs  = ggml_soft_max(ctx, g_logits);
+    // B2 FIX: ggml_argsort_top_k returns a VIEW over the FULL 128-expert argsort rows — its
+    // ggml_nbytes is the window's only at nt==1 (16 B; at nt==2 it is 528 B and a linear tensor
+    // read of the [4, nt] window would both overflow the host buffer and interleave the rows'
+    // leftovers — MEASURED with ASAN: the store arm's first nt=2 step memcpy'd 528 B into the
+    // 32-B sel vector).  nt==1 keeps the shipped view EXACTLY (bytes cannot move); nt>1 makes
+    // the selection CONTIGUOUS so read()/taps and every consumer see the true [4, nt] window.
     g_sel    = ggml_argsort_top_k(ctx, g_probs, N_USED);                       // [4, nt] I32
+    if (nt > 1) g_sel = ggml_cont(ctx, g_sel);
     {
         ggml_tensor * probs3 = ggml_reshape_3d(ctx, g_probs, 1, N_EXPERT, nt);
         ggml_tensor * wts = ggml_get_rows(ctx, probs3, g_sel);                 // [1,4,nt]
@@ -746,14 +754,21 @@ void M1Layer::build(GGUFModel & m, int layer_, ggml_backend_t backend,
 }
 
 void M1Layer::set_input(const float * x, const int32_t * pos, const int64_t * kidx,
-                        const int64_t * n_kv_per_token) {
+                        const int64_t * kv_base, const int64_t * n_kv_per_token) {
     ggml_backend_tensor_set(g_x, x, 0, sizeof(float) * (size_t) H_DIM * nt);
     ggml_backend_tensor_set(g_pos, pos, 0, sizeof(int32_t) * nt);
     ggml_backend_tensor_set(g_kidx, kidx, 0, sizeof(int64_t) * nt);
+    // B1: row t attends [kv_base[t], kv_base[t] + n_kv_per_token[t]) — every cell outside that
+    // range is masked, so the range may start anywhere in the cache (a sequence's own region),
+    // not only at cell 0.  At base 0 / len = pos + 1 this writes the pre-B1 bytes exactly.
     std::vector<float> mask((size_t) n_kv_max * nt, 0.0f);
-    for (int t = 0; t < nt; ++t)
-        for (int64_t i = n_kv_per_token[t]; i < n_kv_max; ++i)
+    for (int t = 0; t < nt; ++t) {
+        const int64_t b = kv_base[t], e = b + n_kv_per_token[t];
+        for (int64_t i = 0; i < b && i < n_kv_max; ++i)
             mask[(size_t) i + (size_t) n_kv_max * t] = -INFINITY;
+        for (int64_t i = e > 0 ? e : 0; i < n_kv_max; ++i)
+            mask[(size_t) i + (size_t) n_kv_max * t] = -INFINITY;
+    }
     ggml_backend_tensor_set(g_mask, mask.data(), 0, sizeof(float) * mask.size());
 }
 
@@ -763,15 +778,18 @@ void M1Layer::read(const ggml_tensor * t, void * dst) const {
 
 // ---- U5: the GPU-core staging path (see m1_layer.h for the contract) ----------------
 void M1Layer::set_input_async(const float * x, const int32_t * pos, const int64_t * kidx,
-                              const int64_t * n_kv_per_token, ggml_backend_t be) {
+                              const int64_t * kv_base, const int64_t * n_kv_per_token,
+                              ggml_backend_t be) {
     CHECK(hstage, "set_input_async on a layer built without the U5 staging (gpu_core only)");
     std::memcpy(hx, x, sizeof(float) * (size_t) H_DIM * nt);
     std::memcpy(hpos, pos, sizeof(int32_t) * nt);
     std::memcpy(hkidx, kidx, sizeof(int64_t) * nt);
-    for (int t = 0; t < nt; ++t)
+    for (int t = 0; t < nt; ++t) {
+        const int64_t b = kv_base[t], e = b + n_kv_per_token[t];
         for (int64_t i = 0; i < n_kv_max; ++i)
             hmask[(size_t) i + (size_t) n_kv_max * t] =
-                i < n_kv_per_token[t] ? 0.0f : -INFINITY;   // the exact bytes set_input writes
+                (i >= b && i < e) ? 0.0f : -INFINITY;   // the exact bytes set_input writes
+    }
     ggml_backend_tensor_set_async(be, g_x,    hx,    0, sizeof(float)   * (size_t) H_DIM * nt);
     ggml_backend_tensor_set_async(be, g_pos,  hpos, 0, sizeof(int32_t)  * nt);
     ggml_backend_tensor_set_async(be, g_kidx, hkidx, 0, sizeof(int64_t)  * nt);

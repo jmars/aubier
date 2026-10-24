@@ -52,3 +52,17 @@ if [ -e "$ROOT/tools/gg_fixture.cpp" ]; then
         -o "$BUILDS/engine/gg_fixture"
     echo "engine_build_m1.sh: built $BUILDS/engine/gg_fixture"
 fi
+
+# m1_batch_test — B2's batch-of-N test rig.  The SAME engine TUs as the m1 binary plus its own
+# driver, linked the same way (the rig drives M1Session through m1_session_step_batch; the m1
+# compile line above is untouched, so that binary's reproducibility is unchanged).
+if [ -e "$ROOT/tools/m1_batch_test.cpp" ]; then
+    /usr/bin/c++ -O2 -std=c++17 \
+        -I "$GGML_INC" -I "$ROOT/engine" \
+        "$ROOT/engine/m1_engine.cpp" "$ROOT/engine/m1_layer.cpp" "$ROOT/tools/m1_batch_test.cpp" \
+        -L "$GGML_LIB" -lggml-hip -lggml-cpu -lggml -lggml-base \
+        -Wl,-rpath,"$GGML_LIB" -Wl,-rpath,"$ROCMLIB" \
+        -Wl,--disable-new-dtags \
+        -o "$BUILDS/engine/m1_batch_test"
+    echo "engine_build_m1.sh: built $BUILDS/engine/m1_batch_test"
+fi

@@ -65,6 +65,14 @@ class Conn {
     bool alive() const { return !dead_; }
     void kill() { dead_ = true; }
     int fd() const { return fd_; }
+    // ACTIVE liveness (B3FIX A3): a non-blocking peek at the socket.  True only on a RECV
+    // ERROR (ECONNRESET &c.) — a client that RST'd is gone even though no write has failed
+    // yet, which is exactly the mid-generation window a cancel check needs.  DELIBERATELY
+    // FALSE on clean EOF: a client may half-close its write side after sending the request
+    // and still be reading the response, so only an error says "gone".  No pending bytes are
+    // consumed (MSG_PEEK); EAGAIN/EWOULDBLOCK (the common case — a healthy open socket)
+    // returns false.
+    bool peer_gone() const;
 
   private:
     friend struct Worker;

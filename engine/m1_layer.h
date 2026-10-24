@@ -209,8 +209,18 @@ struct M1Layer {
                bool m4_kqkv = false,  // H3/U5: the fused attention-core hatch (GPU-core only)
                bool m4_kvwrite = false, // H3/U11: the fused KV-write phase (GPU-core only)
                bool m4_wvb = false);  // H3/U11: the fused wv_b / kqv_mla phase (GPU-core only)
+    // B1 — THE SEAM: row t's mask is 0 on the CELL RANGE [kv_base[t], kv_base[t] + n_kv_per_token[t])
+    // and -INFINITY outside it, and kidx[t] is the cell the row's KV write lands in — so a row's
+    // live window is a (base, len) PAIR, not a bare length.  At N = 1 with base = 0 and
+    // len = pos + 1 the bytes written are exactly the pre-B1 ones (mask[0..pos] = 0,
+    // mask[pos+1..n_kv_max) = -INFINITY), which is what makes the seam lift a no-op.
+    // CALLER'S CONTRACT: kv_base[t] >= 0 and kv_base[t] + n_kv_per_token[t] <= n_kv_max — the fill
+    // CLAMPS to the window [0, n_kv_max) rather than writing past it, so a violated contract
+    // under-masks instead of corrupting memory — and n_kv_per_token[t] >= 1: a row with NO live
+    // cell is all -INFINITY, and softmax's exp(-inf - (-inf)) is NaN, so a padded row must keep
+    // one live cell rather than an empty window.
     void set_input(const float * x, const int32_t * pos, const int64_t * kidx,
-                    const int64_t * n_kv_per_token);
+                    const int64_t * kv_base, const int64_t * n_kv_per_token);
     void read(const ggml_tensor * t, void * dst) const;
 
     // ---- U5: the GPU-core staging path (gpu_core builds only; timing/transfer structure ONLY
@@ -238,7 +248,8 @@ struct M1Layer {
     // the stream).  x/pos/kidx/mask are read immediately into the pinned buffers, so the
     // caller's memory is free as soon as this returns.
     void set_input_async(const float * x, const int32_t * pos, const int64_t * kidx,
-                         const int64_t * n_kv_per_token, ggml_backend_t be);
+                         const int64_t * kv_base, const int64_t * n_kv_per_token,
+                         ggml_backend_t be);
     // queue the five store-arm taps D2H (async; the caller then event-synchronizes inside its
     // core-timing bracket, so the graph's execution is attributed to the core term as before)
     void queue_taps(ggml_backend_t be);

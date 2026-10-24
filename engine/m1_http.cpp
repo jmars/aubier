@@ -107,6 +107,14 @@ bool Conn::head(int status, const char * content_type, const char * extra_header
     return put(h);
 }
 
+bool Conn::peer_gone() const {
+    if (fd_ < 0) return true;
+    char c;
+    const ssize_t r = ::recv(fd_, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r >= 0) return false;                       // data pending or clean EOF: not "gone"
+    return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
 bool Conn::put(const void * p, size_t n) {
     if (dead_) return false;
     if (n == 0) return true;
